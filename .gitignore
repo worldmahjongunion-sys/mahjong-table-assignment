@@ -1,0 +1,7 @@
+.streamlit/secrets.toml
+mahjong.db
+__pycache__/
+*.pyc
+*.db
+*.bak_*
+.streamlit/secrets.toml
