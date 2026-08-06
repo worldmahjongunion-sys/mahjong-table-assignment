@@ -30,7 +30,7 @@ def main() -> None:
     print("最初の主催者アカウントを作成します。")
 
     while True:
-        username = input("ユーザー名（英数字とアンダースコア、3〜30文字）: ").strip()
+        username = input("ユーザー名（英数字とアンダースコア、3〜30文字）: ").strip().lower()
         if db.USERNAME_RE.match(username):
             break
         print("ユーザー名は英数字とアンダースコアで3〜30文字にしてください。")

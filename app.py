@@ -64,7 +64,7 @@ if not auth_status:
             signup_submitted = st.form_submit_button("登録")
 
         if signup_submitted:
-            new_username = new_username.strip()
+            new_username = new_username.strip().lower()
             if invite_code != auth_invite_code:
                 st.error("招待コードが違います。")
             elif not db.USERNAME_RE.match(new_username):
