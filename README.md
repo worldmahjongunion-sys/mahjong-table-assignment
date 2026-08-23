@@ -20,7 +20,7 @@
 
 - Python / Streamlit
 - SQLite（Railway の Volume に保存し、再デプロイでもデータが残る構成）
-- Railway でホスティング
+- Railway でホスティング（本番環境とは別に、検証用の staging 環境あり）
 
 ## ファイル構成
 
