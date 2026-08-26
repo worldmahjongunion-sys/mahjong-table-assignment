@@ -53,6 +53,10 @@ def init_db() -> None:
         if "user_id" not in columns:
             conn.execute("ALTER TABLE members ADD COLUMN user_id INTEGER")
 
+        user_columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+        if "memo" not in user_columns:
+            conn.execute("ALTER TABLE users ADD COLUMN memo TEXT")
+
 
 # ---- users ----
 
