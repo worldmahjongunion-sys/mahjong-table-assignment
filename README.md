@@ -31,6 +31,9 @@
 | `migrate_to_auth.py` | 既存データをアカウント制に移行するためのスクリプト |
 | `Procfile` | Railway での起動コマンド |
 | `requirements.txt` | 依存パッケージ |
+| `requirements-dev.txt` | 開発・テスト用の追加依存パッケージ（pytest） |
+| `tests/` | pytestによる自動テスト |
+| `.github/workflows/tests.yml` | push・PR時に自動テストを実行するGitHub Actions設定 |
 | `.streamlit/` | Streamlit の設定 |
 
 ## ドキュメント
@@ -54,6 +57,15 @@ streamlit run app.py
 ```
 
 ブラウザで `http://localhost:8501` が開きます。
+
+## テスト
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+`main` / `staging` へのpushとPR作成時に、GitHub Actions（`.github/workflows/tests.yml`）で自動実行される。
 
 ## 開発状況
 
