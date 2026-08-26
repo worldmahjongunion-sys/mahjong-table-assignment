@@ -51,3 +51,9 @@ def test_retire_member_excludes_it_from_default_list(temp_db):
 
     assert db.get_members(user_id) == []
     assert len(db.get_members(user_id, include_retired=True)) == 1
+
+
+def test_ci_red_demo_intentionally_fails():
+    # CIが失敗（赤）になることを確認するための、わざと失敗させる一時的なテスト。
+    # 確認後にこのテストごと revert する想定。
+    assert 1 == 2
