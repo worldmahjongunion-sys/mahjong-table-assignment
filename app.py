@@ -46,7 +46,15 @@ authenticator = stauth.Authenticate(
 )
 
 st.title("麻雀卓組みアプリ")
-authenticator.login(location="main")
+try:
+    authenticator.login(location="main")
+except stauth.LoginError:
+    # 保存された自動ログイン用Cookieが、存在しないユーザー名を指している場合
+    # （DBリセットやアカウント削除後の古いCookieなど）にライブラリが投げる例外。
+    # Cookieを破棄してログインフォームを出し直す。
+    authenticator.cookie_controller.delete_cookie()
+    st.warning("ログイン情報の有効期限が切れました。もう一度ログインしてください。")
+    st.rerun()
 
 auth_status = st.session_state.get("authentication_status")
 
@@ -91,6 +99,7 @@ if current_user is None:
     st.error("ユーザー情報の取得に失敗しました。再度ログインしてください。")
     st.stop()
 user_id = current_user["id"]
+tenant_id = current_user["tenant_id"]
 
 with st.sidebar:
     st.write(f"ログイン中: {st.session_state['name']}")
@@ -114,9 +123,9 @@ if submitted:
         st.error(f"メモは{db.MAX_MEMO_LEN}文字以内にしてください。")
     else:
         try:
-            if db.member_exists(user_id, name):
+            if db.member_exists(tenant_id, name):
                 st.warning(f"「{name}」は既に登録されています。重複して登録します。")
-            member_id = db.add_member(user_id, name, memo)
+            member_id = db.add_member(tenant_id, user_id, name, memo)
             st.success(f"「{name}」を登録しました（ID: {member_id}）。")
         except Exception:
             st.error("登録に失敗しました。時間をおいて再度お試しください。")
@@ -132,7 +141,7 @@ with col_show_retired:
 
 order = "name" if sort_option == "名前順" else "created"
 try:
-    members = db.get_members(user_id, order=order, include_retired=show_retired)
+    members = db.get_members(tenant_id, order=order, include_retired=show_retired)
 except Exception:
     st.error("メンバー一覧の取得に失敗しました。")
     members = []
@@ -158,7 +167,7 @@ else:
                     st.session_state[delete_key] = True
             else:
                 if cols[3].button("復帰", key=f"restore_btn_{member['id']}"):
-                    db.restore_member(user_id, member["id"])
+                    db.restore_member(tenant_id, member["id"])
                     st.success(f"「{member['name']}」を復帰しました。")
                     st.rerun()
 
@@ -178,7 +187,7 @@ else:
                         st.error(f"メモは{db.MAX_MEMO_LEN}文字以内にしてください。")
                     else:
                         try:
-                            db.update_member(user_id, member["id"], new_name, new_memo)
+                            db.update_member(tenant_id, member["id"], new_name, new_memo)
                             st.session_state[edit_key] = False
                             st.success("更新しました。")
                             st.rerun()
@@ -189,7 +198,7 @@ else:
                 st.warning(f"「{member['name']}」を削除（引退扱い）します。よろしいですか？過去の大会記録は保持されます。")
                 confirm_cols = st.columns(2)
                 if confirm_cols[0].button("はい、削除する", key=f"confirm_delete_{member['id']}"):
-                    db.retire_member(user_id, member["id"])
+                    db.retire_member(tenant_id, member["id"])
                     st.session_state[delete_key] = False
                     st.success("削除しました（引退扱い）。")
                     st.rerun()
