@@ -46,7 +46,15 @@ authenticator = stauth.Authenticate(
 )
 
 st.title("麻雀卓組みアプリ")
-authenticator.login(location="main")
+try:
+    authenticator.login(location="main")
+except stauth.LoginError:
+    # 保存された自動ログイン用Cookieが、存在しないユーザー名を指している場合
+    # （DBリセットやアカウント削除後の古いCookieなど）にライブラリが投げる例外。
+    # Cookieを破棄してログインフォームを出し直す。
+    authenticator.cookie_controller.delete_cookie()
+    st.warning("ログイン情報の有効期限が切れました。もう一度ログインしてください。")
+    st.rerun()
 
 auth_status = st.session_state.get("authentication_status")
 
