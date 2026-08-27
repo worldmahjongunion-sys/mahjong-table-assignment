@@ -61,3 +61,46 @@ def test_migration_adds_memo_column_without_losing_existing_data(tmp_path, monke
         ("legacy_user",),
     ).fetchone()
     assert row == ("legacy_user", "legacy_hash", None)  # 既存データは壊れず、memoはNULL
+
+
+def test_migration_backfills_tenant_for_legacy_user_and_members(tmp_path, monkeypatch):
+    """テナント導入前のDB（tenant_id列がない）に既存のユーザーとメンバーが
+    入っている状態で init_db() を実行し、専用テナントが自動作成され、
+    メンバーがそのテナントに紐付けられることを確認する。"""
+    db_path = tmp_path / "pre_tenant.db"
+    monkeypatch.setattr(db, "DB_PATH", db_path)
+
+    conn = sqlite3.connect(db_path)
+    conn.execute(_legacy_users_table_columns())
+    conn.execute(
+        "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+        ("legacy_user", "legacy_hash", "2026-01-01T00:00:00"),
+    )
+    conn.execute(
+        """
+        CREATE TABLE members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            name TEXT NOT NULL,
+            memo TEXT,
+            created_at TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO members (user_id, name, memo, created_at) VALUES (1, ?, ?, ?)",
+        ("太郎", "", "2026-01-01T00:00:00"),
+    )
+    conn.commit()
+    conn.close()
+
+    db.init_db()
+
+    user = db.get_user_by_username("legacy_user")
+    assert user["tenant_id"] is not None
+
+    member_tenant_id = sqlite3.connect(db_path).execute(
+        "SELECT tenant_id FROM members WHERE name = ?", ("太郎",)
+    ).fetchone()[0]
+    assert member_tenant_id == user["tenant_id"]
