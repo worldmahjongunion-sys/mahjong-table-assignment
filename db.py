@@ -21,6 +21,9 @@ EMAIL_VERIFICATION_TTL_HOURS = 24
 PASSWORD_RESET_TTL_MINUTES = 30
 TENANT_INVITE_TTL_HOURS = 72
 
+PLANS = ("free", "pro")
+FREE_PLAN_MEMBER_LIMIT = 20
+
 
 class UsernameTakenError(Exception):
     pass
@@ -59,6 +62,17 @@ def init_db() -> None:
             )
             """
         )
+        tenant_columns = {row[1] for row in conn.execute("PRAGMA table_info(tenants)")}
+        if "plan" not in tenant_columns:
+            conn.execute("ALTER TABLE tenants ADD COLUMN plan TEXT NOT NULL DEFAULT 'free'")
+        if "stripe_customer_id" not in tenant_columns:
+            conn.execute("ALTER TABLE tenants ADD COLUMN stripe_customer_id TEXT")
+        if "stripe_subscription_id" not in tenant_columns:
+            conn.execute("ALTER TABLE tenants ADD COLUMN stripe_subscription_id TEXT")
+        if "stripe_subscription_status" not in tenant_columns:
+            conn.execute("ALTER TABLE tenants ADD COLUMN stripe_subscription_status TEXT")
+        if "plan_updated_at" not in tenant_columns:
+            conn.execute("ALTER TABLE tenants ADD COLUMN plan_updated_at TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -253,11 +267,48 @@ def update_password_hash(user_id: int, new_password_hash: str) -> None:
         conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_password_hash, user_id))
 
 
+_TENANT_COLUMNS = (
+    "id, name, created_at, plan, stripe_customer_id, stripe_subscription_id, "
+    "stripe_subscription_status, plan_updated_at"
+)
+
+
 def get_tenant(tenant_id: int) -> dict | None:
     with get_connection() as conn:
         conn.row_factory = sqlite3.Row
-        row = conn.execute("SELECT id, name, created_at FROM tenants WHERE id = ?", (tenant_id,)).fetchone()
+        row = conn.execute(
+            f"SELECT {_TENANT_COLUMNS} FROM tenants WHERE id = ?", (tenant_id,)
+        ).fetchone()
         return dict(row) if row else None
+
+
+def update_tenant_plan(
+    tenant_id: int,
+    plan: str,
+    stripe_customer_id: str | None = None,
+    stripe_subscription_id: str | None = None,
+    stripe_subscription_status: str | None = None,
+) -> None:
+    if plan not in PLANS:
+        raise ValueError(f"不正なプランです: {plan}")
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE tenants
+            SET plan = ?, stripe_customer_id = ?, stripe_subscription_id = ?,
+                stripe_subscription_status = ?, plan_updated_at = ?
+            WHERE id = ?
+            """,
+            (plan, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, _iso(_now()), tenant_id),
+        )
+
+
+def count_active_members(tenant_id: int) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT COUNT(*) FROM members WHERE tenant_id = ? AND is_active = 1", (tenant_id,)
+        )
+        return cur.fetchone()[0]
 
 
 # ---- migration helper ----

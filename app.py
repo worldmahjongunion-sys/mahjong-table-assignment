@@ -2,6 +2,7 @@ import os
 import smtplib
 from email.message import EmailMessage
 
+import stripe
 import streamlit as st
 import streamlit_authenticator as stauth
 
@@ -46,6 +47,12 @@ def build_credentials() -> dict:
 
 
 APP_BASE_URL = get_optional_setting("APP_BASE_URL", "app_base_url", "http://localhost:8501").rstrip("/")
+
+STRIPE_SECRET_KEY = get_optional_setting("STRIPE_SECRET_KEY", "stripe_secret_key")
+STRIPE_PRICE_ID_PRO = get_optional_setting("STRIPE_PRICE_ID_PRO", "stripe_price_id_pro")
+STRIPE_ENABLED = bool(STRIPE_SECRET_KEY and STRIPE_PRICE_ID_PRO)
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
 
 
 def send_email(to_email: str, subject: str, body: str) -> None:
@@ -114,6 +121,41 @@ if reset_token:
                     st.rerun()
             else:
                 st.error("リンクが無効か、有効期限が切れています。もう一度パスワード再設定をお申し込みください。")
+    st.stop()
+
+# ---- Stripe決済完了後のリダイレクト ----
+checkout_status = query_params.get("checkout")
+if checkout_status == "success":
+    session_id = query_params.get("session_id")
+    session = None
+    if session_id and STRIPE_ENABLED:
+        try:
+            session = stripe.checkout.Session.retrieve(session_id)
+        except Exception:
+            session = None
+
+    if session and session.payment_status == "paid" and session.metadata.get("tenant_id"):
+        db.update_tenant_plan(
+            int(session.metadata["tenant_id"]),
+            "pro",
+            stripe_customer_id=session.customer,
+            stripe_subscription_id=session.subscription,
+            stripe_subscription_status="active",
+        )
+        st.success("お支払いが完了しました。Proプランになりました！")
+    else:
+        st.error("決済状況を確認できませんでした。お手数ですが、もう一度アップグレードをお試しください。")
+
+    if st.button("ログイン画面へ"):
+        st.query_params.clear()
+        st.rerun()
+    st.stop()
+
+if checkout_status == "cancel":
+    st.info("決済がキャンセルされました。プランはFreeのままです。")
+    if st.button("ログイン画面へ"):
+        st.query_params.clear()
+        st.rerun()
     st.stop()
 
 # ---- 通常のログイン／サインアップ ----
@@ -239,6 +281,7 @@ if current_user is None:
     st.stop()
 user_id = current_user["id"]
 tenant_id = current_user["tenant_id"]
+tenant_info = db.get_tenant(tenant_id)
 is_admin = current_user["role"] == "admin"
 role_label = "管理者" if is_admin else "一般"
 
@@ -260,6 +303,27 @@ with st.sidebar:
                 st.code(st.session_state["last_invite_link"])
                 st.caption(f"{db.TENANT_INVITE_TTL_HOURS}時間有効・1回限り使用できます。")
 
+        with st.expander("プラン", expanded=(tenant_info["plan"] == "free")):
+            if tenant_info["plan"] == "pro":
+                st.success("Proプラン（メンバー無制限）")
+            else:
+                st.write(f"Freeプラン（メンバー{db.FREE_PLAN_MEMBER_LIMIT}人まで）")
+                if not STRIPE_ENABLED:
+                    st.caption("Stripe未設定のため、アップグレードは準備中です。")
+                else:
+                    if st.button("Proにアップグレード（¥980/月）"):
+                        checkout_session = stripe.checkout.Session.create(
+                            mode="subscription",
+                            line_items=[{"price": STRIPE_PRICE_ID_PRO, "quantity": 1}],
+                            success_url=f"{APP_BASE_URL}/?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
+                            cancel_url=f"{APP_BASE_URL}/?checkout=cancel",
+                            customer_email=current_user["email"],
+                            metadata={"tenant_id": str(tenant_id)},
+                        )
+                        st.session_state["checkout_url"] = checkout_session.url
+                    if st.session_state.get("checkout_url"):
+                        st.link_button("お支払いページへ進む", st.session_state["checkout_url"])
+
 if not current_user["email_verified"]:
     st.warning("メールアドレスの確認がまだ完了していません。確認メール内のリンクをクリックしてください。")
     if st.button("確認メールを再送する"):
@@ -278,12 +342,22 @@ st.header("メンバー登録")
 if not is_admin:
     st.info("メンバーの登録・編集・削除は管理者のみ行えます。一覧の閲覧はできます。")
 else:
+    member_count = db.count_active_members(tenant_id)
+    plan_limit_reached = tenant_info["plan"] == "free" and member_count >= db.FREE_PLAN_MEMBER_LIMIT
+    if plan_limit_reached:
+        st.warning(
+            f"Freeプランはメンバー{db.FREE_PLAN_MEMBER_LIMIT}人までです。"
+            "サイドバーの「プラン」からProにアップグレードすると無制限に登録できます。"
+        )
+
     with st.form("member_form", clear_on_submit=True):
         name = st.text_input("名前")
         memo = st.text_input("メモ（任意）")
         submitted = st.form_submit_button("登録")
 
-    if submitted:
+    if submitted and plan_limit_reached:
+        st.error(f"Freeプランの上限（{db.FREE_PLAN_MEMBER_LIMIT}人）に達しています。")
+    elif submitted:
         name = name.strip()
         memo = memo.strip()
         if not name:
