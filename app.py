@@ -535,7 +535,7 @@ if is_operator:
                 }
                 for t in tenants_overview
             ]
-            st.dataframe(tenant_rows, hide_index=True, use_container_width=True)
+            st.dataframe(tenant_rows, hide_index=True, width="stretch")
             st.caption(f"テナント数: {len(tenants_overview)}")
 
         st.subheader("直近の監査ログ（テナント横断）")
@@ -553,7 +553,7 @@ if is_operator:
                 }
                 for a in audit_logs_all
             ]
-            st.dataframe(audit_rows, hide_index=True, use_container_width=True)
+            st.dataframe(audit_rows, hide_index=True, width="stretch")
 
 # ---- 初回ガイド ----
 # 「テナント作成→招待リンク発行→最初のメンバーが参加」の3ステップを、
