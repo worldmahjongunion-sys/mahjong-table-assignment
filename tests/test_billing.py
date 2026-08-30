@@ -40,6 +40,54 @@ def test_update_tenant_plan_to_pro_stores_stripe_ids(temp_db):
     assert tenant["stripe_subscription_status"] == "active"
 
 
+def test_update_tenant_plan_defaults_to_not_cancelled(temp_db):
+    db.add_user("owner", "hash")
+    tenant_id = db.get_user_by_username("owner")["tenant_id"]
+
+    db.update_tenant_plan(tenant_id, "pro", stripe_customer_id="cus_123")
+
+    tenant = db.get_tenant(tenant_id)
+    assert tenant["stripe_cancel_at_period_end"] is False
+    assert tenant["stripe_current_period_end"] is None
+
+
+def test_update_tenant_plan_stores_cancel_at_period_end(temp_db):
+    db.add_user("owner", "hash")
+    tenant_id = db.get_user_by_username("owner")["tenant_id"]
+
+    db.update_tenant_plan(
+        tenant_id,
+        "pro",
+        stripe_customer_id="cus_123",
+        stripe_subscription_id="sub_456",
+        stripe_subscription_status="active",
+        cancel_at_period_end=True,
+        current_period_end="2026-09-30T00:00:00+00:00",
+    )
+
+    tenant = db.get_tenant(tenant_id)
+    assert tenant["plan"] == "pro"
+    assert tenant["stripe_cancel_at_period_end"] is True
+    assert tenant["stripe_current_period_end"] == "2026-09-30T00:00:00+00:00"
+
+
+def test_get_tenant_by_stripe_customer_id_returns_cancel_state(temp_db):
+    db.add_user("owner", "hash")
+    tenant_id = db.get_user_by_username("owner")["tenant_id"]
+    db.update_tenant_plan(
+        tenant_id,
+        "pro",
+        stripe_customer_id="cus_lookup",
+        cancel_at_period_end=True,
+        current_period_end="2026-09-30T00:00:00+00:00",
+    )
+
+    tenant = db.get_tenant_by_stripe_customer_id("cus_lookup")
+
+    assert tenant["id"] == tenant_id
+    assert tenant["stripe_cancel_at_period_end"] is True
+
+
 def test_update_tenant_plan_rejects_unknown_plan(temp_db):
     db.add_user("owner", "hash")
     tenant_id = db.get_user_by_username("owner")["tenant_id"]

@@ -1,5 +1,6 @@
 import os
 import smtplib
+from datetime import datetime, timezone
 from email.message import EmailMessage
 
 import stripe
@@ -11,6 +12,13 @@ import db
 st.set_page_config(page_title="麻雀卓組みアプリ", page_icon="🀄")
 
 db.init_db()
+
+
+def format_date_jp(iso_str: str | None) -> str:
+    if not iso_str:
+        return "不明"
+    dt = datetime.fromisoformat(iso_str)
+    return f"{dt.year}年{dt.month}月{dt.day}日"
 
 
 def get_auth_setting(env_var: str, secrets_key: str) -> str:
@@ -306,6 +314,36 @@ with st.sidebar:
         with st.expander("プラン", expanded=(tenant_info["plan"] == "free")):
             if tenant_info["plan"] == "pro":
                 st.success("Proプラン（メンバー無制限）")
+                if tenant_info["stripe_cancel_at_period_end"]:
+                    st.warning(
+                        "解約予約中です。今の請求期間の終わり"
+                        f"（{format_date_jp(tenant_info['stripe_current_period_end'])}）"
+                        "まではProプランを利用できます。"
+                    )
+                elif STRIPE_ENABLED and tenant_info["stripe_subscription_id"]:
+                    if st.button("解約する"):
+                        try:
+                            subscription = stripe.Subscription.modify(
+                                tenant_info["stripe_subscription_id"],
+                                cancel_at_period_end=True,
+                            )
+                            period_end_ts = subscription["items"]["data"][0]["current_period_end"]
+                            period_end_iso = datetime.fromtimestamp(
+                                period_end_ts, tz=timezone.utc
+                            ).isoformat(timespec="seconds")
+                            db.update_tenant_plan(
+                                tenant_id,
+                                "pro",
+                                stripe_customer_id=tenant_info["stripe_customer_id"],
+                                stripe_subscription_id=subscription.id,
+                                stripe_subscription_status=subscription.status,
+                                cancel_at_period_end=True,
+                                current_period_end=period_end_iso,
+                            )
+                            st.success("解約を予約しました。")
+                            st.rerun()
+                        except Exception:
+                            st.error("解約処理に失敗しました。時間をおいて再度お試しください。")
             else:
                 st.write(f"Freeプラン（メンバー{db.FREE_PLAN_MEMBER_LIMIT}人まで）")
                 if not STRIPE_ENABLED:

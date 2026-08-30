@@ -28,6 +28,7 @@
 | --- | --- |
 | `app.py` | 画面と操作。Streamlit のエントリーポイント |
 | `db.py` | SQLite への読み書き |
+| `webhook_server.py` | Stripe Webhook（課金成功・失敗・解約）を受け取る薄いFlaskサーバー |
 | `migrate_to_auth.py` | 既存データをアカウント制に移行するためのスクリプト |
 | `Procfile` | Railway での起動コマンド |
 | `requirements.txt` | 依存パッケージ |
@@ -58,6 +59,25 @@ streamlit run app.py
 ```
 
 ブラウザで `http://localhost:8501` が開きます。
+
+## Stripe Webhookをローカルで動かす
+
+課金の成功・失敗・解約はStripeからのWebhookで同期する（`webhook_server.py`、詳細はファイル冒頭のdocstring参照）。
+
+```bash
+# 1. Webhookサーバーを起動する準備として、別ターミナルでStripe CLIの転送を開始
+stripe listen --forward-to localhost:4242/stripe/webhook
+# ここで表示される whsec_... をコピーする
+
+# 2. コピーした値を設定してWebhookサーバーを起動
+STRIPE_WEBHOOK_SECRET=whsec_xxx python webhook_server.py
+
+# 3. さらに別ターミナルでテストイベントを送る
+stripe trigger checkout.session.completed
+stripe trigger customer.subscription.updated
+stripe trigger customer.subscription.deleted
+stripe trigger invoice.payment_failed
+```
 
 ## テスト
 

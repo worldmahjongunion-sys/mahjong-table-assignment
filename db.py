@@ -73,6 +73,12 @@ def init_db() -> None:
             conn.execute("ALTER TABLE tenants ADD COLUMN stripe_subscription_status TEXT")
         if "plan_updated_at" not in tenant_columns:
             conn.execute("ALTER TABLE tenants ADD COLUMN plan_updated_at TEXT")
+        if "stripe_cancel_at_period_end" not in tenant_columns:
+            conn.execute(
+                "ALTER TABLE tenants ADD COLUMN stripe_cancel_at_period_end INTEGER NOT NULL DEFAULT 0"
+            )
+        if "stripe_current_period_end" not in tenant_columns:
+            conn.execute("ALTER TABLE tenants ADD COLUMN stripe_current_period_end TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -269,8 +275,15 @@ def update_password_hash(user_id: int, new_password_hash: str) -> None:
 
 _TENANT_COLUMNS = (
     "id, name, created_at, plan, stripe_customer_id, stripe_subscription_id, "
-    "stripe_subscription_status, plan_updated_at"
+    "stripe_subscription_status, plan_updated_at, "
+    "stripe_cancel_at_period_end, stripe_current_period_end"
 )
+
+
+def _row_to_tenant(row: sqlite3.Row) -> dict:
+    tenant = dict(row)
+    tenant["stripe_cancel_at_period_end"] = bool(tenant["stripe_cancel_at_period_end"])
+    return tenant
 
 
 def get_tenant(tenant_id: int) -> dict | None:
@@ -279,7 +292,17 @@ def get_tenant(tenant_id: int) -> dict | None:
         row = conn.execute(
             f"SELECT {_TENANT_COLUMNS} FROM tenants WHERE id = ?", (tenant_id,)
         ).fetchone()
-        return dict(row) if row else None
+        return _row_to_tenant(row) if row else None
+
+
+def get_tenant_by_stripe_customer_id(stripe_customer_id: str) -> dict | None:
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            f"SELECT {_TENANT_COLUMNS} FROM tenants WHERE stripe_customer_id = ?",
+            (stripe_customer_id,),
+        ).fetchone()
+        return _row_to_tenant(row) if row else None
 
 
 def update_tenant_plan(
@@ -288,7 +311,16 @@ def update_tenant_plan(
     stripe_customer_id: str | None = None,
     stripe_subscription_id: str | None = None,
     stripe_subscription_status: str | None = None,
+    cancel_at_period_end: bool = False,
+    current_period_end: str | None = None,
 ) -> None:
+    """テナントの課金状態をまとめて書き換える（全カラムを上書きする）。
+
+    cancel_at_period_end / current_period_end を意図せずリセットしないよう、
+    呼び出し側は必要に応じて既存の tenant の値を読み出してから渡すこと
+    （invoice.payment_failed など、Stripeのイベントに解約予約の情報が
+    含まれない場合は tenant["stripe_cancel_at_period_end"] 等をそのまま渡す）。
+    """
     if plan not in PLANS:
         raise ValueError(f"不正なプランです: {plan}")
     with get_connection() as conn:
@@ -296,10 +328,20 @@ def update_tenant_plan(
             """
             UPDATE tenants
             SET plan = ?, stripe_customer_id = ?, stripe_subscription_id = ?,
-                stripe_subscription_status = ?, plan_updated_at = ?
+                stripe_subscription_status = ?, plan_updated_at = ?,
+                stripe_cancel_at_period_end = ?, stripe_current_period_end = ?
             WHERE id = ?
             """,
-            (plan, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, _iso(_now()), tenant_id),
+            (
+                plan,
+                stripe_customer_id,
+                stripe_subscription_id,
+                stripe_subscription_status,
+                _iso(_now()),
+                int(cancel_at_period_end),
+                current_period_end,
+                tenant_id,
+            ),
         )
 
 
