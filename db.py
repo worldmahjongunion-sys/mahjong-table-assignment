@@ -290,6 +290,55 @@ def get_audit_logs(tenant_id: int, limit: int = 200) -> list[dict]:
         return [dict(row) for row in cur.fetchall()]
 
 
+def get_audit_logs_all_tenants(limit: int = 200) -> list[dict]:
+    """テナントを横断した直近の監査ログ。運営専用画面向け。"""
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            """
+            SELECT a.id, a.tenant_id, t.name AS tenant_name, a.user_id, a.username,
+                   a.action, a.detail, a.created_at
+            FROM audit_logs a
+            LEFT JOIN tenants t ON t.id = a.tenant_id
+            ORDER BY a.id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+# ---- 運営専用: テナント横断の一覧 ----
+
+def get_tenant_overview() -> list[dict]:
+    """全テナントの一覧（プラン・課金状態・有効メンバー数・作成日）。運営専用画面向け。"""
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            """
+            SELECT
+                t.id,
+                t.name,
+                t.plan,
+                t.stripe_subscription_status,
+                t.stripe_cancel_at_period_end,
+                t.created_at,
+                (
+                    SELECT COUNT(*) FROM members m
+                    WHERE m.tenant_id = t.id AND m.is_active = 1
+                ) AS member_count
+            FROM tenants t
+            ORDER BY t.id ASC
+            """
+        )
+        rows = []
+        for row in cur.fetchall():
+            row = dict(row)
+            row["stripe_cancel_at_period_end"] = bool(row["stripe_cancel_at_period_end"])
+            rows.append(row)
+        return rows
+
+
 # ---- users ----
 
 def add_user(

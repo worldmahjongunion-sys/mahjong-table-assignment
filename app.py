@@ -64,6 +64,12 @@ def build_credentials() -> dict:
 
 APP_BASE_URL = get_optional_setting("APP_BASE_URL", "app_base_url", "http://localhost:8501").rstrip("/")
 
+# 運営（自分）専用の管理画面にアクセスできるユーザー名の一覧。
+# テナントのrole（admin/member）とは独立した、テナント横断の権限。
+# カンマ区切りで複数指定可。ここに載っていないユーザーには画面自体を一切表示しない。
+_OPERATOR_USERNAMES_RAW = get_optional_setting("OPERATOR_USERNAMES", "operator_usernames", "") or ""
+OPERATOR_USERNAMES = {u.strip().lower() for u in _OPERATOR_USERNAMES_RAW.split(",") if u.strip()}
+
 STRIPE_SECRET_KEY = get_optional_setting("STRIPE_SECRET_KEY", "stripe_secret_key")
 STRIPE_PRICE_ID_PRO = get_optional_setting("STRIPE_PRICE_ID_PRO", "stripe_price_id_pro")
 STRIPE_ENABLED = bool(STRIPE_SECRET_KEY and STRIPE_PRICE_ID_PRO)
@@ -376,6 +382,7 @@ tenant_id = current_user["tenant_id"]
 tenant_info = db.get_tenant(tenant_id)
 is_admin = current_user["role"] == "admin"
 role_label = "管理者" if is_admin else "一般"
+is_operator = current_user["username"] in OPERATOR_USERNAMES
 
 with st.sidebar:
     st.write(f"ログイン中: {st.session_state['name']}（{role_label}）")
@@ -498,6 +505,55 @@ if not current_user["email_verified"]:
             )
             st.info("確認メールを再送しました。")
     st.stop()
+
+# ---- 運営専用画面 ----
+# is_operator は OPERATOR_USERNAMES（環境変数/secrets）に載っているユーザー名だけが
+# Trueになる、テナントのrole（admin/member）とは独立した権限。載っていないユーザーは
+# 一般利用者はもちろん、他テナントの管理者であってもこのブロック自体が描画されないため、
+# 存在にすら気づけない。
+if is_operator:
+    st.divider()
+    with st.expander("🔧 運営管理（Operator Only）", expanded=False):
+        st.caption("全テナントの状況をテナント横断で確認できます。運営者のみ閲覧できます。")
+
+        st.subheader("テナント一覧")
+        tenants_overview = db.get_tenant_overview()
+        if not tenants_overview:
+            st.info("テナントがありません。")
+        else:
+            tenant_rows = [
+                {
+                    "テナントID": t["id"],
+                    "テナント名": t["name"],
+                    "プラン": "Pro" if t["plan"] == "pro" else "Free",
+                    "課金状態": (
+                        (t["stripe_subscription_status"] or "-")
+                        + ("（解約予約中）" if t["stripe_cancel_at_period_end"] else "")
+                    ),
+                    "メンバー数": t["member_count"],
+                    "作成日": format_date_jp(t["created_at"]),
+                }
+                for t in tenants_overview
+            ]
+            st.dataframe(tenant_rows, hide_index=True, use_container_width=True)
+            st.caption(f"テナント数: {len(tenants_overview)}")
+
+        st.subheader("直近の監査ログ（テナント横断）")
+        audit_logs_all = db.get_audit_logs_all_tenants(limit=200)
+        if not audit_logs_all:
+            st.info("監査ログがありません。")
+        else:
+            audit_rows = [
+                {
+                    "日時": a["created_at"],
+                    "テナント": a["tenant_name"] or f"(削除済み ID:{a['tenant_id']})",
+                    "ユーザー": a["username"] or "-",
+                    "操作": a["action"],
+                    "詳細": a["detail"] or "",
+                }
+                for a in audit_logs_all
+            ]
+            st.dataframe(audit_rows, hide_index=True, use_container_width=True)
 
 st.header("メンバー登録")
 
