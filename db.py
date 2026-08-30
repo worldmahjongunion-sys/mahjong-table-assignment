@@ -25,6 +25,19 @@ PLANS = ("free", "pro")
 FREE_PLAN_MEMBER_LIMIT = 20
 FREE_PLAN_INVITE_MONTHLY_LIMIT = 3
 
+# ---- レート制限（総当たり攻撃対策） ----
+# 資格情報の推測を狙う操作（ログイン・招待コード）は短い窓で厳しめに、
+# メール送信系（悪用されるとメール爆撃の踏み台になる）は長い窓でやや緩めに設定する。
+LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 5
+LOGIN_RATE_LIMIT_WINDOW_MINUTES = 15
+INVITE_CODE_RATE_LIMIT_MAX_ATTEMPTS = 5
+INVITE_CODE_RATE_LIMIT_WINDOW_MINUTES = 15
+PASSWORD_RESET_RATE_LIMIT_MAX_ATTEMPTS = 3
+PASSWORD_RESET_RATE_LIMIT_WINDOW_MINUTES = 60
+EMAIL_VERIFY_RESEND_RATE_LIMIT_MAX_ATTEMPTS = 3
+EMAIL_VERIFY_RESEND_RATE_LIMIT_WINDOW_MINUTES = 60
+RATE_LIMIT_EVENT_RETENTION_DAYS = 1
+
 
 class UsernameTakenError(Exception):
     pass
@@ -185,6 +198,96 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rate_limit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bucket TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rate_limit_events_bucket ON rate_limit_events(bucket, created_at)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id INTEGER,
+                user_id INTEGER,
+                username TEXT,
+                action TEXT NOT NULL,
+                detail TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant ON audit_logs(tenant_id, id)"
+        )
+
+
+# ---- レート制限（総当たり攻撃対策） ----
+# bucketは操作の種類と対象を表す自由形式の文字列
+# （例: "login:{username}", "signup_invite_code", "password_reset:{email}"）。
+# 直近RATE_LIMIT_EVENT_RETENTION_DAYS分より古いイベントは記録のたびに間引くので、
+# テーブルは無制限には増えない。
+
+def record_rate_limit_event(bucket: str) -> None:
+    now = _now()
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM rate_limit_events WHERE created_at < ?",
+            (_iso(now - timedelta(days=RATE_LIMIT_EVENT_RETENTION_DAYS)),),
+        )
+        conn.execute(
+            "INSERT INTO rate_limit_events (bucket, created_at) VALUES (?, ?)",
+            (bucket, _iso(now)),
+        )
+
+
+def count_recent_rate_limit_events(bucket: str, window_minutes: int) -> int:
+    window_start = _iso(_now() - timedelta(minutes=window_minutes))
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT COUNT(*) FROM rate_limit_events WHERE bucket = ? AND created_at >= ?",
+            (bucket, window_start),
+        )
+        return cur.fetchone()[0]
+
+
+def is_rate_limited(bucket: str, max_attempts: int, window_minutes: int) -> bool:
+    return count_recent_rate_limit_events(bucket, window_minutes) >= max_attempts
+
+
+# ---- 監査ログ ----
+
+def record_audit_log(
+    action: str,
+    tenant_id: int | None = None,
+    user_id: int | None = None,
+    username: str | None = None,
+    detail: str = "",
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO audit_logs (tenant_id, user_id, username, action, detail, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (tenant_id, user_id, username, action, detail, _iso(_now())),
+        )
+
+
+def get_audit_logs(tenant_id: int, limit: int = 200) -> list[dict]:
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            "SELECT * FROM audit_logs WHERE tenant_id = ? ORDER BY id DESC LIMIT ?",
+            (tenant_id, limit),
+        )
+        return [dict(row) for row in cur.fetchall()]
 
 
 # ---- users ----
@@ -314,6 +417,8 @@ def update_tenant_plan(
     stripe_subscription_status: str | None = None,
     cancel_at_period_end: bool = False,
     current_period_end: str | None = None,
+    actor_user_id: int | None = None,
+    actor_username: str | None = None,
 ) -> None:
     """テナントの課金状態をまとめて書き換える（全カラムを上書きする）。
 
@@ -321,6 +426,10 @@ def update_tenant_plan(
     呼び出し側は必要に応じて既存の tenant の値を読み出してから渡すこと
     （invoice.payment_failed など、Stripeのイベントに解約予約の情報が
     含まれない場合は tenant["stripe_cancel_at_period_end"] 等をそのまま渡す）。
+
+    呼び出し元がすべて（Webhook・Checkoutリダイレクト・解約ボタンなど）ここを
+    通るため、監査ログへの記録もここに集約している。actor_* はUI操作で人が
+    起点の場合のみ渡し、Webhookなどシステム起点の場合はNoneのままでよい。
     """
     if plan not in PLANS:
         raise ValueError(f"不正なプランです: {plan}")
@@ -342,6 +451,19 @@ def update_tenant_plan(
                 int(cancel_at_period_end),
                 current_period_end,
                 tenant_id,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO audit_logs (tenant_id, user_id, username, action, detail, created_at)
+            VALUES (?, ?, ?, 'plan_change', ?, ?)
+            """,
+            (
+                tenant_id,
+                actor_user_id,
+                actor_username,
+                f"plan={plan}, status={stripe_subscription_status}, cancel_at_period_end={cancel_at_period_end}",
+                _iso(_now()),
             ),
         )
 
@@ -506,13 +628,39 @@ def consume_tenant_invite(raw_token: str) -> dict | None:
 
 # ---- members (all scoped to tenant_id) ----
 
-def add_member(tenant_id: int, user_id: int, name: str, memo: str) -> int:
-    with get_connection() as conn:
+def add_member(
+    tenant_id: int, user_id: int, name: str, memo: str, max_members: int | None = None
+) -> int | None:
+    """メンバーを追加する。max_membersを指定すると、有効メンバー数が上限に
+    達していれば追加せずNoneを返す。
+
+    上限チェックと追加をBEGIN IMMEDIATEで開始した単一トランザクション内で行う
+    ことで、同時に複数リクエストが来ても上限を超えて追加されないようにする
+    （SELECT COUNTしてから別にINSERTする素朴な実装だと、2つのリクエストが
+    どちらも上限未満の件数を読んでしまい、両方追加されてしまうレースがある）。
+    """
+    conn = sqlite3.connect(DB_PATH, isolation_level=None)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("BEGIN IMMEDIATE")
+        if max_members is not None:
+            current_count = conn.execute(
+                "SELECT COUNT(*) FROM members WHERE tenant_id = ? AND is_active = 1", (tenant_id,)
+            ).fetchone()[0]
+            if current_count >= max_members:
+                conn.execute("ROLLBACK")
+                return None
         cur = conn.execute(
             "INSERT INTO members (tenant_id, user_id, name, memo, created_at) VALUES (?, ?, ?, ?, ?)",
             (tenant_id, user_id, name, memo, _iso(_now())),
         )
+        conn.execute("COMMIT")
         return cur.lastrowid
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
 
 
 def member_exists(tenant_id: int, name: str) -> bool:

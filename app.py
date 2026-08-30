@@ -1,8 +1,10 @@
 import os
+import secrets
 import smtplib
 from datetime import datetime, timezone
 from email.message import EmailMessage
 
+import bcrypt
 import stripe
 import streamlit as st
 import streamlit_authenticator as stauth
@@ -13,6 +15,11 @@ import exports
 st.set_page_config(page_title="麻雀卓組みアプリ", page_icon="🀄")
 
 db.init_db()
+
+# ログイン試行のタイミング差から既存ユーザー名かどうかを推測されないよう、
+# ユーザーが存在しない場合もこのダミーハッシュ相手にbcrypt検証を行い、
+# 検証にかかる時間を実在ユーザーの場合とそろえる。
+_DUMMY_PASSWORD_HASH = bcrypt.hashpw(b"dummy-password-for-timing", bcrypt.gensalt()).decode()
 
 
 def format_date_jp(iso_str: str | None) -> str:
@@ -150,6 +157,7 @@ if checkout_status == "success":
             stripe_customer_id=session.customer,
             stripe_subscription_id=session.subscription,
             stripe_subscription_status="active",
+            actor_username="stripe_checkout_redirect",
         )
         st.success("お支払いが完了しました。Proプランになりました！")
     else:
@@ -180,15 +188,63 @@ authenticator = stauth.Authenticate(
     auto_hash=False,
 )
 
-try:
-    authenticator.login(location="main")
-except stauth.LoginError:
-    # 保存された自動ログイン用Cookieが、存在しないユーザー名を指している場合
-    # （DBリセットやアカウント削除後の古いCookieなど）にライブラリが投げる例外。
-    # Cookieを破棄してログインフォームを出し直す。
-    authenticator.cookie_controller.delete_cookie()
-    st.warning("ログイン情報の有効期限が切れました。もう一度ログインしてください。")
-    st.rerun()
+# streamlit-authenticatorの標準ログイン(authenticator.login())は使わず、
+# 自前でフォームと認証チェックを実装している。理由:
+# - 標準実装の総当たり対策(max_login_attempts)は、認証情報の辞書を毎リラン
+#   再構築しているためリランをまたいで失敗回数を保持できず機能しない
+# - 入力されたユーザー名を受け取れないと、ユーザー名単位のレート制限が組めない
+# Cookie経由の自動ログインとログアウトは引き続きauthenticatorに任せる。
+
+if not st.session_state.get("authentication_status"):
+    cookie_token = authenticator.cookie_controller.get_cookie()
+    if cookie_token and "username" in cookie_token:
+        cookie_user = db.get_user_by_username(cookie_token["username"])
+        if cookie_user:
+            st.session_state["authentication_status"] = True
+            st.session_state["username"] = cookie_user["username"]
+            st.session_state["name"] = cookie_user["username"]
+        else:
+            # 保存された自動ログイン用Cookieが、存在しないユーザー名を指している場合
+            # （DBリセットやアカウント削除後の古いCookieなど）。Cookieを破棄する。
+            authenticator.cookie_controller.delete_cookie()
+            st.warning("ログイン情報の有効期限が切れました。もう一度ログインしてください。")
+
+if not st.session_state.get("authentication_status"):
+    with st.form("login_form"):
+        login_username_input = st.text_input("Username", autocomplete="off")
+        login_password_input = st.text_input("Password", type="password", autocomplete="off")
+        login_submitted = st.form_submit_button("Login")
+
+    if login_submitted:
+        login_username_norm = login_username_input.strip().lower()
+        login_bucket = f"login:{login_username_norm}"
+        if db.is_rate_limited(
+            login_bucket, db.LOGIN_RATE_LIMIT_MAX_ATTEMPTS, db.LOGIN_RATE_LIMIT_WINDOW_MINUTES
+        ):
+            st.session_state["authentication_status"] = None
+            st.error(
+                "ログイン試行が多すぎます。"
+                f"{db.LOGIN_RATE_LIMIT_WINDOW_MINUTES}分ほど時間をおいて再度お試しください。"
+            )
+        else:
+            login_user = db.get_user_by_username(login_username_norm)
+            hash_to_check = login_user["password_hash"] if login_user else _DUMMY_PASSWORD_HASH
+            password_ok = stauth.Hasher.check_pw(login_password_input, hash_to_check)
+            if login_user and password_ok:
+                st.session_state["authentication_status"] = True
+                st.session_state["username"] = login_user["username"]
+                st.session_state["name"] = login_user["username"]
+                authenticator.cookie_controller.set_cookie()
+                db.record_audit_log(
+                    action="login",
+                    tenant_id=login_user["tenant_id"],
+                    user_id=login_user["id"],
+                    username=login_user["username"],
+                )
+                st.rerun()
+            else:
+                db.record_rate_limit_event(login_bucket)
+                st.session_state["authentication_status"] = False
 
 auth_status = st.session_state.get("authentication_status")
 
@@ -222,7 +278,18 @@ if not auth_status:
         if signup_submitted:
             new_username = new_username.strip().lower()
             new_email = new_email.strip().lower()
-            if not tenant_invite and invite_code != auth_invite_code:
+            invite_code_bucket = "signup_invite_code"
+            if not tenant_invite and db.is_rate_limited(
+                invite_code_bucket,
+                db.INVITE_CODE_RATE_LIMIT_MAX_ATTEMPTS,
+                db.INVITE_CODE_RATE_LIMIT_WINDOW_MINUTES,
+            ):
+                st.error(
+                    "招待コードの試行回数が多すぎます。"
+                    f"{db.INVITE_CODE_RATE_LIMIT_WINDOW_MINUTES}分ほど時間をおいて再度お試しください。"
+                )
+            elif not tenant_invite and not secrets.compare_digest(invite_code, auth_invite_code):
+                db.record_rate_limit_event(invite_code_bucket)
                 st.error("招待コードが違います。")
             elif not db.USERNAME_RE.match(new_username):
                 st.error("ユーザー名は英数字とアンダースコアで3〜30文字にしてください。")
@@ -268,17 +335,33 @@ if not auth_status:
 
         if forgot_submitted:
             forgot_email = forgot_email.strip().lower()
-            user = db.get_user_by_email(forgot_email) if forgot_email else None
-            if user:
-                reset_raw_token = db.create_password_reset_token(user["id"])
-                reset_link = f"{APP_BASE_URL}/?reset={reset_raw_token}"
-                send_email(
-                    user["email"],
-                    "【麻雀卓組みアプリ】パスワード再設定のご案内",
-                    f"以下のリンクからパスワードを再設定してください（{db.PASSWORD_RESET_TTL_MINUTES}分間有効）。\n{reset_link}",
+            forgot_bucket = f"password_reset:{forgot_email}"
+            if forgot_email and db.is_rate_limited(
+                forgot_bucket,
+                db.PASSWORD_RESET_RATE_LIMIT_MAX_ATTEMPTS,
+                db.PASSWORD_RESET_RATE_LIMIT_WINDOW_MINUTES,
+            ):
+                # このメールアドレス宛のリクエストが直近で既に上限に達している場合の案内。
+                # bucketはメール存在有無に関係なく常に記録するため、この分岐が出ても
+                # 「そのメールアドレスが登録されている」ことは漏れない。
+                st.warning(
+                    "リクエストが多すぎます。"
+                    f"{db.PASSWORD_RESET_RATE_LIMIT_WINDOW_MINUTES}分ほど時間をおいて再度お試しください。"
                 )
-            # メール登録の有無を教えない（メールアドレスの存在確認への悪用を防ぐ）
-            st.success("入力されたメールアドレスが登録されている場合、再設定用のリンクを送信しました。")
+            else:
+                if forgot_email:
+                    db.record_rate_limit_event(forgot_bucket)
+                user = db.get_user_by_email(forgot_email) if forgot_email else None
+                if user:
+                    reset_raw_token = db.create_password_reset_token(user["id"])
+                    reset_link = f"{APP_BASE_URL}/?reset={reset_raw_token}"
+                    send_email(
+                        user["email"],
+                        "【麻雀卓組みアプリ】パスワード再設定のご案内",
+                        f"以下のリンクからパスワードを再設定してください（{db.PASSWORD_RESET_TTL_MINUTES}分間有効）。\n{reset_link}",
+                    )
+                # メール登録の有無を教えない（メールアドレスの存在確認への悪用を防ぐ）
+                st.success("入力されたメールアドレスが登録されている場合、再設定用のリンクを送信しました。")
 
     st.stop()
 
@@ -326,6 +409,13 @@ with st.sidebar:
             if st.button("招待リンクを発行", disabled=invite_limit_reached):
                 invite_raw_token = db.create_tenant_invite(tenant_id, user_id, role=invite_role)
                 st.session_state["last_invite_link"] = f"{APP_BASE_URL}/?invite={invite_raw_token}"
+                db.record_audit_log(
+                    action="invite_issued",
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    username=current_user["username"],
+                    detail=f"role={invite_role}",
+                )
                 st.rerun()
             if st.session_state.get("last_invite_link"):
                 st.code(st.session_state["last_invite_link"])
@@ -359,6 +449,8 @@ with st.sidebar:
                                 stripe_subscription_status=subscription.status,
                                 cancel_at_period_end=True,
                                 current_period_end=period_end_iso,
+                                actor_user_id=user_id,
+                                actor_username=current_user["username"],
                             )
                             st.success("解約を予約しました。")
                             st.rerun()
@@ -385,14 +477,26 @@ with st.sidebar:
 if not current_user["email_verified"]:
     st.warning("メールアドレスの確認がまだ完了していません。確認メール内のリンクをクリックしてください。")
     if st.button("確認メールを再送する"):
-        verify_raw_token = db.create_email_verification_token(user_id)
-        verify_link = f"{APP_BASE_URL}/?verify={verify_raw_token}"
-        send_email(
-            current_user["email"],
-            "【麻雀卓組みアプリ】メールアドレスの確認",
-            f"以下のリンクをクリックしてメールアドレスを確認してください（{db.EMAIL_VERIFICATION_TTL_HOURS}時間有効）。\n{verify_link}",
-        )
-        st.info("確認メールを再送しました。")
+        resend_bucket = f"email_verify_resend:{user_id}"
+        if db.is_rate_limited(
+            resend_bucket,
+            db.EMAIL_VERIFY_RESEND_RATE_LIMIT_MAX_ATTEMPTS,
+            db.EMAIL_VERIFY_RESEND_RATE_LIMIT_WINDOW_MINUTES,
+        ):
+            st.warning(
+                "再送リクエストが多すぎます。"
+                f"{db.EMAIL_VERIFY_RESEND_RATE_LIMIT_WINDOW_MINUTES}分ほど時間をおいて再度お試しください。"
+            )
+        else:
+            db.record_rate_limit_event(resend_bucket)
+            verify_raw_token = db.create_email_verification_token(user_id)
+            verify_link = f"{APP_BASE_URL}/?verify={verify_raw_token}"
+            send_email(
+                current_user["email"],
+                "【麻雀卓組みアプリ】メールアドレスの確認",
+                f"以下のリンクをクリックしてメールアドレスを確認してください（{db.EMAIL_VERIFICATION_TTL_HOURS}時間有効）。\n{verify_link}",
+            )
+            st.info("確認メールを再送しました。")
     st.stop()
 
 st.header("メンバー登録")
@@ -413,9 +517,7 @@ else:
         memo = st.text_input("メモ（任意）")
         submitted = st.form_submit_button("登録")
 
-    if submitted and plan_limit_reached:
-        st.error(f"Freeプランの上限（{db.FREE_PLAN_MEMBER_LIMIT}人）に達しています。")
-    elif submitted:
+    if submitted:
         name = name.strip()
         memo = memo.strip()
         if not name:
@@ -428,8 +530,21 @@ else:
             try:
                 if db.member_exists(tenant_id, name):
                     st.warning(f"「{name}」は既に登録されています。重複して登録します。")
-                member_id = db.add_member(tenant_id, user_id, name, memo)
-                st.success(f"「{name}」を登録しました（ID: {member_id}）。")
+                # 上限チェックはadd_member内で追加と同一トランザクションで行う
+                # （同時リクエストでもFreeプランの上限を超えて追加されないように）。
+                max_members = db.FREE_PLAN_MEMBER_LIMIT if tenant_info["plan"] == "free" else None
+                member_id = db.add_member(tenant_id, user_id, name, memo, max_members=max_members)
+                if member_id is None:
+                    st.error(f"Freeプランの上限（{db.FREE_PLAN_MEMBER_LIMIT}人）に達しています。")
+                else:
+                    db.record_audit_log(
+                        action="member_add",
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        username=current_user["username"],
+                        detail=f"member_id={member_id}, name={name}",
+                    )
+                    st.success(f"「{name}」を登録しました（ID: {member_id}）。")
             except Exception:
                 st.error("登録に失敗しました。時間をおいて再度お試しください。")
 
@@ -449,26 +564,29 @@ except Exception:
     st.error("メンバー一覧の取得に失敗しました。")
     members = []
 
-col_export_csv, col_export_xlsx = st.columns(2)
-if tenant_info["plan"] == "pro":
-    col_export_csv.download_button(
-        "CSVでダウンロード",
-        data=exports.build_members_csv(members),
-        file_name="members.csv",
-        mime="text/csv",
-        disabled=not members,
-    )
-    col_export_xlsx.download_button(
-        "Excelでダウンロード",
-        data=exports.build_members_xlsx(members),
-        file_name="members.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        disabled=not members,
-    )
+if is_admin:
+    col_export_csv, col_export_xlsx = st.columns(2)
+    if tenant_info["plan"] == "pro":
+        col_export_csv.download_button(
+            "CSVでダウンロード",
+            data=exports.build_members_csv(members),
+            file_name="members.csv",
+            mime="text/csv",
+            disabled=not members,
+        )
+        col_export_xlsx.download_button(
+            "Excelでダウンロード",
+            data=exports.build_members_xlsx(members),
+            file_name="members.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            disabled=not members,
+        )
+    else:
+        col_export_csv.button("🔒 CSVでダウンロード", disabled=True)
+        col_export_xlsx.button("🔒 Excelでダウンロード", disabled=True)
+        st.caption("CSV/Excelへのエクスポートは Proプランで使えます。")
 else:
-    col_export_csv.button("🔒 CSVでダウンロード", disabled=True)
-    col_export_xlsx.button("🔒 Excelでダウンロード", disabled=True)
-    st.caption("CSV/Excelへのエクスポートは Proプランで使えます。")
+    st.caption("CSV/Excelへのエクスポートは管理者のみ利用できます。")
 
 if not members:
     st.info("登録されているメンバーがいません。")
@@ -524,6 +642,13 @@ else:
                 confirm_cols = st.columns(2)
                 if confirm_cols[0].button("はい、削除する", key=f"confirm_delete_{member['id']}"):
                     db.retire_member(tenant_id, member["id"])
+                    db.record_audit_log(
+                        action="member_retire",
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        username=current_user["username"],
+                        detail=f"member_id={member['id']}, name={member['name']}",
+                    )
                     st.session_state[delete_key] = False
                     st.success("削除しました（引退扱い）。")
                     st.rerun()

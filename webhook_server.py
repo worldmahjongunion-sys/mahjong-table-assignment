@@ -109,6 +109,7 @@ def _sync_from_subscription(subscription: dict) -> None:
         stripe_subscription_status=status,
         cancel_at_period_end=bool(subscription.get("cancel_at_period_end")),
         current_period_end=_current_period_end_iso(subscription),
+        actor_username="stripe_webhook",
     )
     logger.info(
         "tenant_id=%s plan=%s status=%s cancel_at_period_end=%s に更新しました",
@@ -147,6 +148,7 @@ def stripe_webhook():
                 stripe_subscription_status="active",
                 cancel_at_period_end=False,
                 current_period_end=None,
+                actor_username="stripe_webhook",
             )
             logger.info("tenant_id=%s をProプランに更新しました（決済完了）", tenant_id)
         else:
@@ -171,6 +173,7 @@ def stripe_webhook():
                 stripe_subscription_status="canceled",
                 cancel_at_period_end=False,
                 current_period_end=None,
+                actor_username="stripe_webhook",
             )
             logger.info("tenant_id=%s をFreeプランに戻しました（解約）", tenant["id"])
 
@@ -190,6 +193,7 @@ def stripe_webhook():
                 stripe_subscription_status="past_due",
                 cancel_at_period_end=tenant["stripe_cancel_at_period_end"],
                 current_period_end=tenant["stripe_current_period_end"],
+                actor_username="stripe_webhook",
             )
             logger.warning("tenant_id=%s の課金に失敗しました（past_due）", tenant["id"])
 
@@ -207,6 +211,7 @@ def stripe_webhook():
                 stripe_subscription_status="active",
                 cancel_at_period_end=tenant["stripe_cancel_at_period_end"],
                 current_period_end=tenant["stripe_current_period_end"],
+                actor_username="stripe_webhook",
             )
             logger.info("tenant_id=%s の課金が成功しました（active）", tenant["id"])
 
