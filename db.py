@@ -525,6 +525,13 @@ def count_active_members(tenant_id: int) -> int:
         return cur.fetchone()[0]
 
 
+def count_tenant_users(tenant_id: int) -> int:
+    """テナントに所属するユーザー（ログインアカウント）数。初回ガイドの進捗表示に使う。"""
+    with get_connection() as conn:
+        cur = conn.execute("SELECT COUNT(*) FROM users WHERE tenant_id = ?", (tenant_id,))
+        return cur.fetchone()[0]
+
+
 # ---- migration helper ----
 
 def assign_orphaned_members(user_id: int) -> int:
@@ -645,6 +652,15 @@ def count_tenant_invites_this_month(tenant_id: int) -> int:
         cur = conn.execute(
             "SELECT COUNT(*) FROM tenant_invites WHERE tenant_id = ? AND created_at >= ?",
             (tenant_id, month_start),
+        )
+        return cur.fetchone()[0]
+
+
+def count_tenant_invites_total(tenant_id: int) -> int:
+    """テナントがこれまでに発行した招待リンクの総数（月次上限とは無関係）。初回ガイドの進捗表示に使う。"""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT COUNT(*) FROM tenant_invites WHERE tenant_id = ?", (tenant_id,)
         )
         return cur.fetchone()[0]
 

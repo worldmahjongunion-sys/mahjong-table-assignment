@@ -555,6 +555,33 @@ if is_operator:
             ]
             st.dataframe(audit_rows, hide_index=True, use_container_width=True)
 
+# ---- 初回ガイド ----
+# 「テナント作成→招待リンク発行→最初のメンバーが参加」の3ステップを、
+# まだチームメンバー（ログインアカウント）が管理者本人しかいない間だけ表示する。
+# 卓組み生成機能は未実装のため、この導線には含めない。
+if is_admin and db.count_tenant_users(tenant_id) <= 1:
+    with st.container(border=True):
+        st.subheader("👋 はじめに：3ステップで最初のチームメンバーを迎えましょう")
+        st.caption(
+            "ここでの「チームメンバー」は、一緒にこのアプリを運営するログインアカウント"
+            "（管理者・一般）のことです。大会参加者の登録は、下の「メンバー登録」から行えます。"
+        )
+
+        st.markdown(f"1. ✅ **テナント作成** — 「{tenant_info['name']}」を作成しました。")
+
+        if db.count_tenant_invites_total(tenant_id) > 0:
+            st.markdown("2. ✅ **招待リンクを発行** 済みです。")
+        else:
+            st.markdown(
+                "2. ⬜ **招待リンクを発行しましょう** — "
+                "サイドバーの「メンバーを招待する」から発行し、一緒に運営する人に共有してください。"
+            )
+
+        st.markdown(
+            "3. ⬜ **最初のメンバーが参加するのを待ちましょう** — "
+            "招待リンクからサインアップが完了すると、この案内は自動的に消えます。"
+        )
+
 st.header("メンバー登録")
 
 if not is_admin:
