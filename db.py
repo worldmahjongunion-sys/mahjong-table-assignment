@@ -23,6 +23,7 @@ TENANT_INVITE_TTL_HOURS = 72
 
 PLANS = ("free", "pro")
 FREE_PLAN_MEMBER_LIMIT = 20
+FREE_PLAN_INVITE_MONTHLY_LIMIT = 3
 
 
 class UsernameTakenError(Exception):
@@ -463,6 +464,18 @@ def create_tenant_invite(
             (tenant_id, _hash_token(raw_token), created_by_user_id, role, max_uses, _iso(now), _iso(expires_at)),
         )
     return raw_token
+
+
+def count_tenant_invites_this_month(tenant_id: int) -> int:
+    """今月（暦月）に発行された招待の件数。Freeプランの月次上限チェックに使う。"""
+    now = _now()
+    month_start = _iso(datetime(now.year, now.month, 1))
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT COUNT(*) FROM tenant_invites WHERE tenant_id = ? AND created_at >= ?",
+            (tenant_id, month_start),
+        )
+        return cur.fetchone()[0]
 
 
 def get_tenant_invite(raw_token: str) -> dict | None:

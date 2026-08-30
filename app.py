@@ -8,6 +8,7 @@ import streamlit as st
 import streamlit_authenticator as stauth
 
 import db
+import exports
 
 st.set_page_config(page_title="麻雀卓組みアプリ", page_icon="🀄")
 
@@ -304,9 +305,28 @@ with st.sidebar:
                 options=["member", "admin"],
                 format_func=lambda r: "一般" if r == "member" else "管理者",
             )
-            if st.button("招待リンクを発行"):
+
+            is_pro = tenant_info["plan"] == "pro"
+            invites_this_month = db.count_tenant_invites_this_month(tenant_id)
+            invite_limit_reached = not is_pro and invites_this_month >= db.FREE_PLAN_INVITE_MONTHLY_LIMIT
+
+            if is_pro:
+                st.caption("Proプランは招待リンクを無制限に発行できます。")
+            else:
+                remaining = max(db.FREE_PLAN_INVITE_MONTHLY_LIMIT - invites_this_month, 0)
+                st.caption(
+                    f"Freeプランは招待リンクの発行が月{db.FREE_PLAN_INVITE_MONTHLY_LIMIT}回までです。"
+                    f"今月あと{remaining}回発行できます。"
+                )
+
+            if invite_limit_reached:
+                st.warning(
+                    "今月の発行上限に達しました。サイドバーの「プラン」からProにアップグレードすると無制限になります。"
+                )
+            if st.button("招待リンクを発行", disabled=invite_limit_reached):
                 invite_raw_token = db.create_tenant_invite(tenant_id, user_id, role=invite_role)
                 st.session_state["last_invite_link"] = f"{APP_BASE_URL}/?invite={invite_raw_token}"
+                st.rerun()
             if st.session_state.get("last_invite_link"):
                 st.code(st.session_state["last_invite_link"])
                 st.caption(f"{db.TENANT_INVITE_TTL_HOURS}時間有効・1回限り使用できます。")
@@ -428,6 +448,27 @@ try:
 except Exception:
     st.error("メンバー一覧の取得に失敗しました。")
     members = []
+
+col_export_csv, col_export_xlsx = st.columns(2)
+if tenant_info["plan"] == "pro":
+    col_export_csv.download_button(
+        "CSVでダウンロード",
+        data=exports.build_members_csv(members),
+        file_name="members.csv",
+        mime="text/csv",
+        disabled=not members,
+    )
+    col_export_xlsx.download_button(
+        "Excelでダウンロード",
+        data=exports.build_members_xlsx(members),
+        file_name="members.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        disabled=not members,
+    )
+else:
+    col_export_csv.button("🔒 CSVでダウンロード", disabled=True)
+    col_export_xlsx.button("🔒 Excelでダウンロード", disabled=True)
+    st.caption("CSV/Excelへのエクスポートは Proプランで使えます。")
 
 if not members:
     st.info("登録されているメンバーがいません。")

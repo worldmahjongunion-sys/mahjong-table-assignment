@@ -127,3 +127,41 @@ def test_tenant_invite_with_max_uses_one_is_exhausted_after_use(temp_db):
 
 def test_tenant_invite_rejects_unknown_token(temp_db):
     assert db.get_tenant_invite("no-such-token") is None
+
+
+def test_count_tenant_invites_this_month_only_counts_current_month(temp_db):
+    admin_id = db.add_user("owner", "hash", email="owner@example.com")
+    tenant_id = db.get_user_by_username("owner")["tenant_id"]
+
+    db.create_tenant_invite(tenant_id, admin_id)
+    db.create_tenant_invite(tenant_id, admin_id)
+
+    last_month = datetime.now() - timedelta(days=40)
+    with db.get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO tenant_invites
+                (tenant_id, token_hash, created_by_user_id, role, max_uses, use_count, created_at, expires_at)
+            VALUES (?, 'dummy_hash_last_month', ?, 'member', 1, 0, ?, ?)
+            """,
+            (
+                tenant_id,
+                admin_id,
+                last_month.isoformat(timespec="seconds"),
+                last_month.isoformat(timespec="seconds"),
+            ),
+        )
+
+    assert db.count_tenant_invites_this_month(tenant_id) == 2
+
+
+def test_count_tenant_invites_this_month_is_scoped_to_tenant(temp_db):
+    admin_a = db.add_user("owner_a", "hash", email="a@example.com")
+    admin_b = db.add_user("owner_b", "hash", email="b@example.com")
+    tenant_a = db.get_user_by_username("owner_a")["tenant_id"]
+    tenant_b = db.get_user_by_username("owner_b")["tenant_id"]
+
+    db.create_tenant_invite(tenant_a, admin_a)
+
+    assert db.count_tenant_invites_this_month(tenant_a) == 1
+    assert db.count_tenant_invites_this_month(tenant_b) == 0
