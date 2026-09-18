@@ -36,6 +36,9 @@ def render_scoring_config_inputs(scoring_mode: str, key_prefix: str, defaults: d
 
     表紙画面(519〜622行目付近)と同じ入力項目・初期値を、大会作成・編集フォームでも
     再利用するための共通処理。key_prefixで呼び出しごとにウィジェットキーを一意化する。
+
+    ポイント方式には表紙画面にはない「開始点数」欄を追加で描画する
+    （ゲスト向け画面実装依頼_Stage2.md 4章①対応。詳細は関数末尾のコメント参照）。
     """
     defaults = defaults or {}
     if scoring_mode == "得点":
@@ -107,7 +110,161 @@ def render_scoring_config_inputs(scoring_mode: str, key_prefix: str, defaults: d
                     key=f"{key_prefix}_rank_point_{i}",
                 )
             )
-    return {"rank_point_table": rank_point_table_input}
+
+    # ゲスト向け画面実装依頼_Stage2.md 4章①対応: ポイント方式の大会にも開始点数だけを
+    # 必須入力として持たせる（ウマ表・オカ・飛び賞額は追加しない）。ゲスト画面の成績入力で
+    # 「4人分の素点合計＝開始点数×4」チェックに使うためで、点数計算そのものには使わない。
+    start_point = st.number_input(
+        "開始点数（持ち点。ゲスト成績入力の合計チェックに使用）",
+        value=defaults.get("start_point", scoring_logic.DEFAULT_UMA_CONFIG["start_point"]),
+        step=1000,
+        key=f"{key_prefix}_start_point",
+    )
+    return {"rank_point_table": rank_point_table_input, "start_point": start_point}
+
+
+def render_guest_view(guest_token: str) -> None:
+    """ゲスト共有リンク(`?guest=<トークン>`)専用画面（ゲスト向け画面実装依頼_Stage2.md 3章対応）。
+
+    ログイン・アカウント作成を経由しない。呼び出し元でこの関数のあとに必ずst.stop()すること
+    ――主催者向け画面・ログイン画面のコードを一切実行させないことで、この画面から他大会・
+    主催者向けデータへ一切アクセスできないことを担保する（3.1対応）。
+    """
+    tournament = db.get_tournament_by_guest_token(guest_token)
+    if tournament is None:
+        st.error("このリンクは使えません。主催者に最新のリンクを確認してください。")
+        return
+
+    st.subheader(f"🀄 {tournament['name']}")
+
+    tournament_members = db.get_tournament_members(tournament["id"])
+    member_id_to_name = {tm["member_id"]: tm["member_name"] for tm in tournament_members}
+
+    rounds = db.get_rounds(tournament["id"])
+    if not rounds:
+        st.info("まだ回戦がありません。主催者が回戦を実行するまでお待ちください。")
+        return
+
+    round_options = {r["round_number"]: r["id"] for r in rounds}
+    round_numbers = list(round_options.keys())
+    selected_round_number = st.selectbox(
+        "回戦", options=round_numbers, index=len(round_numbers) - 1, key="guest_round_select"
+    )
+    selected_round_id = round_options[selected_round_number]
+
+    seats = db.get_round_seats(selected_round_id)
+    absences = db.get_round_absences(selected_round_id)
+    existing_scores = db.get_round_results(selected_round_id)
+    existing_busters = db.get_round_tobi_busters(selected_round_id)
+
+    by_table: dict[int, list] = {}
+    for seat in seats:
+        by_table.setdefault(seat["table_number"], []).append(seat)
+
+    st.write("**卓組み結果**")
+    for table_number, table_seats in sorted(by_table.items()):
+        table_member_ids = [s["member_id"] for s in table_seats]
+        status = "入力済み" if all(mid in existing_scores for mid in table_member_ids) else "未入力"
+        st.write(f"卓{table_number}（{status}）")
+        for seat in table_seats:
+            st.write(f"　{seat['position']}: {member_id_to_name.get(seat['member_id'], seat['member_id'])}")
+
+    if absences:
+        absent_names = "、".join(member_id_to_name.get(mid, str(mid)) for mid in absences)
+        st.caption(f"抜け番: {absent_names}さん")
+
+    st.divider()
+    st.write("**成績の入力**")
+
+    start_point = tournament["scoring_config"].get("start_point")
+    if start_point is None:
+        st.warning("主催者が開始点数を設定するまで入力できません。")
+    elif not by_table:
+        st.caption("この回戦は卓がありません。")
+    else:
+        table_numbers = sorted(by_table.keys())
+        selected_table_number = st.selectbox("卓を選択", options=table_numbers, key="guest_table_select")
+        table_seats = by_table[selected_table_number]
+        table_member_ids = [s["member_id"] for s in table_seats]
+        already_submitted = all(mid in existing_scores for mid in table_member_ids)
+
+        if already_submitted:
+            st.info("この卓はすでに入力済みです。修正は主催者に依頼してください。")
+            for mid in table_member_ids:
+                st.write(f"{member_id_to_name.get(mid, mid)}: {existing_scores[mid]:,}点")
+        else:
+            raw_scores_input = {}
+            for seat in table_seats:
+                member_id = seat["member_id"]
+                raw_scores_input[member_id] = st.number_input(
+                    f"{member_id_to_name.get(member_id, member_id)}（{seat['position']}）の素点",
+                    value=0,
+                    step=100,
+                    key=f"guest_score_{selected_round_id}_{member_id}",
+                )
+
+            tobi_busters_input = {}
+            if tournament["scoring_mode"] == "得点":
+                for seat in table_seats:
+                    member_id = seat["member_id"]
+                    if raw_scores_input[member_id] <= 0:
+                        other_member_ids = [m for m in table_member_ids if m != member_id]
+                        default_busters = [
+                            b for b in existing_busters.get(member_id, []) if b in other_member_ids
+                        ]
+                        chosen_busters = st.multiselect(
+                            f"「{member_id_to_name.get(member_id, member_id)}」を飛ばした人",
+                            options=other_member_ids,
+                            default=default_busters,
+                            format_func=lambda m: member_id_to_name.get(m, m),
+                            key=f"guest_busters_{selected_round_id}_{member_id}",
+                        )
+                        if chosen_busters:
+                            tobi_busters_input[member_id] = chosen_busters
+
+            total = sum(raw_scores_input.values())
+            expected_total = start_point * 4
+            sum_ok = total == expected_total
+            if sum_ok:
+                st.success(f"合計 {total:,} 点です。")
+            else:
+                st.error(f"合計が {total:,} 点です。{expected_total:,} 点になるよう確認してください。")
+
+            confirm = st.checkbox(
+                "送信すると修正できません。内容を確認しました。",
+                key=f"guest_confirm_{selected_round_id}_{selected_table_number}",
+            )
+            if st.button(
+                "この内容で送信する",
+                disabled=not (sum_ok and confirm),
+                width="stretch",
+                key=f"guest_submit_{selected_round_id}_{selected_table_number}",
+            ):
+                try:
+                    db.submit_guest_round_results(selected_round_id, raw_scores_input, tobi_busters_input)
+                    st.success("送信しました。")
+                    st.rerun()
+                except db.ResultsAlreadySubmittedError:
+                    st.warning("すでに入力済みです。ページを再読み込みしてください。")
+
+    st.divider()
+    st.write("**大会内順位表**")
+    standings = tournament_service.compute_standings(tournament)
+    appearance_counts = tournament_service.build_appearance_counts(tournament["id"])
+    if not standings:
+        st.caption("まだ成績がありません。")
+    else:
+        st.table(
+            [
+                {
+                    "順位": i + 1,
+                    "氏名": member_id_to_name.get(row["member_id"], row["member_id"]),
+                    "値": row["value"],
+                    "参加回戦数": appearance_counts.get(row["player_number"], 0),
+                }
+                for i, row in enumerate(standings)
+            ]
+        )
 
 
 def get_auth_setting(env_var: str, secrets_key: str) -> str:
@@ -187,6 +344,16 @@ def send_email(to_email: str, subject: str, body: str) -> None:
 st.title("麻雀卓組みアプリ")
 
 query_params = st.query_params
+
+# ---- ゲスト共有リンク ----
+# ログイン・アカウント作成フローより前に判定する。ここで処理してst.stop()することで、
+# 以降のログイン画面・主催者向け画面のコードを一切実行させない
+# （ゲスト向け画面実装依頼_Stage2.md 3.1「ゲスト画面からは主催者向けの画面・
+# 他の大会のデータに一切アクセスできないこと」に対応）。
+guest_token = query_params.get("guest")
+if guest_token:
+    render_guest_view(guest_token)
+    st.stop()
 
 # ---- メールアドレス確認リンク ----
 verify_token = query_params.get("verify")

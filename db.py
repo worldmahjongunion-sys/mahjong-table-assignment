@@ -353,6 +353,21 @@ def init_db() -> None:
             """
         )
 
+        # ゲスト向け画面実装依頼_Stage2.md 3.3/6章対応: 「誰がいつ・ゲスト/主催者どちらの
+        # 経路で入力したか」を後から追えるよう、成績関連レコードに入力日時・入力経路を追加する。
+        # 既存行はNULL（空欄）のままでよい。
+        results_columns = {row[1] for row in conn.execute("PRAGMA table_info(results)")}
+        if "created_at" not in results_columns:
+            conn.execute("ALTER TABLE results ADD COLUMN created_at TEXT")
+        if "input_source" not in results_columns:
+            conn.execute("ALTER TABLE results ADD COLUMN input_source TEXT")
+
+        tobi_busters_columns = {row[1] for row in conn.execute("PRAGMA table_info(tobi_busters)")}
+        if "created_at" not in tobi_busters_columns:
+            conn.execute("ALTER TABLE tobi_busters ADD COLUMN created_at TEXT")
+        if "input_source" not in tobi_busters_columns:
+            conn.execute("ALTER TABLE tobi_busters ADD COLUMN input_source TEXT")
+
 
 # ---- レート制限（総当たり攻撃対策） ----
 # bucketは操作の種類と対象を表す自由形式の文字列
@@ -1156,26 +1171,76 @@ def get_round_absences(round_id: int) -> list[int]:
 # ---- results (成績) ----
 
 def save_round_results(round_id: int, raw_scores: dict, tobi_busters: dict) -> None:
-    """素点と飛び賞の「誰が飛ばしたか」を保存する。
+    """主催者による成績の入力・修正。素点と飛び賞の「誰が飛ばしたか」を保存する。
 
     raw_scores: {member_id: 素点}
     tobi_busters: {飛んだmember_id: [飛ばしたmember_id, ...]}
-    既存レコードがあれば削除してから入れ直す（成績入力の編集に対応するため）。
+    既存レコードがあれば削除してから入れ直す（成績入力の修正に対応するため。
+    ゲストによる新規入力は上書きしないsubmit_guest_round_resultsを使う）。
+    入力経路は常に'admin'として記録する（ゲスト向け画面実装依頼_Stage2.md 3.5対応）。
     """
+    now = _iso(_now())
     with get_connection() as conn:
         conn.execute("DELETE FROM results WHERE round_id = ?", (round_id,))
         conn.execute("DELETE FROM tobi_busters WHERE round_id = ?", (round_id,))
         for member_id, raw_score in raw_scores.items():
             conn.execute(
-                "INSERT INTO results (round_id, member_id, raw_score) VALUES (?, ?, ?)",
-                (round_id, member_id, raw_score),
+                "INSERT INTO results (round_id, member_id, raw_score, created_at, input_source) "
+                "VALUES (?, ?, ?, ?, 'admin')",
+                (round_id, member_id, raw_score, now),
             )
         for busted_member_id, busters in tobi_busters.items():
             for buster_member_id in busters:
                 conn.execute(
-                    "INSERT INTO tobi_busters (round_id, busted_member_id, buster_member_id) VALUES (?, ?, ?)",
-                    (round_id, busted_member_id, buster_member_id),
+                    "INSERT INTO tobi_busters (round_id, busted_member_id, buster_member_id, created_at, input_source) "
+                    "VALUES (?, ?, ?, ?, 'admin')",
+                    (round_id, busted_member_id, buster_member_id, now),
                 )
+
+
+class ResultsAlreadySubmittedError(Exception):
+    pass
+
+
+def submit_guest_round_results(round_id: int, raw_scores: dict, tobi_busters: dict) -> None:
+    """ゲストによる成績の新規入力（ゲスト向け画面実装依頼_Stage2.md 3.3対応）。
+
+    save_round_resultsと異なり、既存レコードを削除せず新規INSERTのみを行う。
+    resultsテーブルの`UNIQUE(round_id, member_id)`制約により、その卓の
+    いずれかのメンバーについて既にレコードがある場合はsqlite3.IntegrityErrorが
+    発生する。これをResultsAlreadySubmittedErrorに変換し、トランザクション全体を
+    ロールバックする（同じ卓への同時送信で、後から届いた方を保存しないことの
+    担保をDBのUNIQUE制約自体で行う。アプリ側の事前チェックには依存しない）。
+    入力経路は常に'guest'として記録する。
+    """
+    now = _iso(_now())
+    try:
+        with get_connection() as conn:
+            for member_id, raw_score in raw_scores.items():
+                conn.execute(
+                    "INSERT INTO results (round_id, member_id, raw_score, created_at, input_source) "
+                    "VALUES (?, ?, ?, ?, 'guest')",
+                    (round_id, member_id, raw_score, now),
+                )
+            for busted_member_id, busters in tobi_busters.items():
+                for buster_member_id in busters:
+                    conn.execute(
+                        "INSERT INTO tobi_busters (round_id, busted_member_id, buster_member_id, created_at, input_source) "
+                        "VALUES (?, ?, ?, ?, 'guest')",
+                        (round_id, busted_member_id, buster_member_id, now),
+                    )
+    except sqlite3.IntegrityError as exc:
+        raise ResultsAlreadySubmittedError(round_id) from exc
+
+
+def get_round_result_meta(round_id: int) -> dict:
+    """member_id -> {"created_at", "input_source"} を返す（監査・テスト用）。"""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT member_id, created_at, input_source FROM results WHERE round_id = ?",
+            (round_id,),
+        )
+        return {row[0]: {"created_at": row[1], "input_source": row[2]} for row in cur.fetchall()}
 
 
 def get_round_results(round_id: int) -> dict:
