@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import re
 import secrets
@@ -25,6 +26,13 @@ PLANS = ("free", "pro")
 FREE_PLAN_MEMBER_LIMIT = 20
 FREE_PLAN_INVITE_MONTHLY_LIMIT = 3
 
+# ---- 大会 ----
+TOURNAMENT_KINDS = ("ワンデー", "シーズン")
+TABLE_METHODS = ("蛇行", "ワンデー4半荘")
+SCORING_MODES = ("得点", "ポイント")
+NUMBERING_METHODS = ("受付順", "くじ引き")
+TOURNAMENT_STATUSES = ("準備中", "進行中", "終了")
+
 # ---- レート制限（総当たり攻撃対策） ----
 # 資格情報の推測を狙う操作（ログイン・招待コード）は短い窓で厳しめに、
 # メール送信系（悪用されるとメール爆撃の踏み台になる）は長い窓でやや緩めに設定する。
@@ -40,6 +48,14 @@ RATE_LIMIT_EVENT_RETENTION_DAYS = 1
 
 
 class UsernameTakenError(Exception):
+    pass
+
+
+class PlayerNumberTakenError(Exception):
+    pass
+
+
+class MemberAlreadyRegisteredError(Exception):
     pass
 
 
@@ -225,6 +241,116 @@ def init_db() -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant ON audit_logs(tenant_id, id)"
+        )
+
+        # ---- 大会管理・回戦実施・ゲスト共有リンク ----
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tournaments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id INTEGER NOT NULL REFERENCES tenants(id),
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                table_method TEXT NOT NULL,
+                scoring_mode TEXT NOT NULL,
+                scoring_config TEXT NOT NULL,
+                numbering_method TEXT NOT NULL,
+                start_date TEXT,
+                end_date TEXT,
+                status TEXT NOT NULL DEFAULT '準備中',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tournaments_tenant ON tournaments(tenant_id, id)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tournament_members (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tournament_id INTEGER NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
+                member_id INTEGER NOT NULL REFERENCES members(id),
+                player_number INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(tournament_id, player_number),
+                UNIQUE(tournament_id, member_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rounds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tournament_id INTEGER NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
+                round_number INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(tournament_id, round_number)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tables (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                round_id INTEGER NOT NULL REFERENCES rounds(id) ON DELETE CASCADE,
+                table_number INTEGER NOT NULL,
+                UNIQUE(round_id, table_number)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS seats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_id INTEGER NOT NULL REFERENCES tables(id) ON DELETE CASCADE,
+                member_id INTEGER NOT NULL REFERENCES members(id),
+                position TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS absences (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                round_id INTEGER NOT NULL REFERENCES rounds(id) ON DELETE CASCADE,
+                member_id INTEGER NOT NULL REFERENCES members(id),
+                UNIQUE(round_id, member_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                round_id INTEGER NOT NULL REFERENCES rounds(id) ON DELETE CASCADE,
+                member_id INTEGER NOT NULL REFERENCES members(id),
+                raw_score INTEGER NOT NULL,
+                UNIQUE(round_id, member_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tobi_busters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                round_id INTEGER NOT NULL REFERENCES rounds(id) ON DELETE CASCADE,
+                busted_member_id INTEGER NOT NULL REFERENCES members(id),
+                buster_member_id INTEGER NOT NULL REFERENCES members(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tournament_guest_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tournament_id INTEGER NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_by_user_id INTEGER NOT NULL REFERENCES users(id),
+                created_at TEXT NOT NULL,
+                revoked_at TEXT
+            )
+            """
         )
 
 
@@ -768,3 +894,364 @@ def restore_member(tenant_id: int, member_id: int) -> None:
         conn.execute(
             "UPDATE members SET is_active = 1 WHERE id = ? AND tenant_id = ?", (member_id, tenant_id)
         )
+
+
+# ---- tournaments (大会) ----
+
+_TOURNAMENT_COLUMNS = (
+    "id, tenant_id, name, kind, table_method, scoring_mode, scoring_config, "
+    "numbering_method, start_date, end_date, status, created_at"
+)
+
+
+def _row_to_tournament(row: sqlite3.Row) -> dict:
+    tournament = dict(row)
+    config = json.loads(tournament["scoring_config"])
+    if tournament["scoring_mode"] == "得点" and "uma_table" in config:
+        # JSONのオブジェクトキーは文字列になるため、浮き人数(int)キーに戻す
+        config["uma_table"] = {int(k): v for k, v in config["uma_table"].items()}
+    tournament["scoring_config"] = config
+    return tournament
+
+
+def create_tournament(
+    tenant_id: int,
+    name: str,
+    kind: str,
+    table_method: str,
+    scoring_mode: str,
+    scoring_config: dict,
+    numbering_method: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> int:
+    if kind not in TOURNAMENT_KINDS:
+        raise ValueError(f"不正な大会種別です: {kind}")
+    if table_method not in TABLE_METHODS:
+        raise ValueError(f"不正な卓組み方式です: {table_method}")
+    if scoring_mode not in SCORING_MODES:
+        raise ValueError(f"不正な評価方式です: {scoring_mode}")
+    if numbering_method not in NUMBERING_METHODS:
+        raise ValueError(f"不正な選手番号の採番方式です: {numbering_method}")
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO tournaments
+                (tenant_id, name, kind, table_method, scoring_mode, scoring_config,
+                 numbering_method, start_date, end_date, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '準備中', ?)
+            """,
+            (
+                tenant_id,
+                name,
+                kind,
+                table_method,
+                scoring_mode,
+                json.dumps(scoring_config),
+                numbering_method,
+                start_date,
+                end_date,
+                _iso(_now()),
+            ),
+        )
+        return cur.lastrowid
+
+
+def get_tournaments(tenant_id: int) -> list[dict]:
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            f"SELECT {_TOURNAMENT_COLUMNS} FROM tournaments WHERE tenant_id = ? ORDER BY id DESC",
+            (tenant_id,),
+        )
+        return [_row_to_tournament(row) for row in cur.fetchall()]
+
+
+def get_tournament(tenant_id: int, tournament_id: int) -> dict | None:
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            f"SELECT {_TOURNAMENT_COLUMNS} FROM tournaments WHERE id = ? AND tenant_id = ?",
+            (tournament_id, tenant_id),
+        ).fetchone()
+        return _row_to_tournament(row) if row else None
+
+
+def update_tournament(
+    tenant_id: int,
+    tournament_id: int,
+    name: str,
+    kind: str,
+    table_method: str,
+    scoring_mode: str,
+    scoring_config: dict,
+    numbering_method: str,
+    start_date: str | None,
+    end_date: str | None,
+    status: str,
+) -> None:
+    if status not in TOURNAMENT_STATUSES:
+        raise ValueError(f"不正な状態です: {status}")
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE tournaments
+            SET name = ?, kind = ?, table_method = ?, scoring_mode = ?, scoring_config = ?,
+                numbering_method = ?, start_date = ?, end_date = ?, status = ?
+            WHERE id = ? AND tenant_id = ?
+            """,
+            (
+                name,
+                kind,
+                table_method,
+                scoring_mode,
+                json.dumps(scoring_config),
+                numbering_method,
+                start_date,
+                end_date,
+                status,
+                tournament_id,
+                tenant_id,
+            ),
+        )
+
+
+def delete_tournament(tenant_id: int, tournament_id: int) -> None:
+    """大会を削除する。参加メンバー・回戦・卓・着席・抜け番・成績・ゲストリンクも
+    外部キーのON DELETE CASCADEにより連動して削除される。"""
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM tournaments WHERE id = ? AND tenant_id = ?", (tournament_id, tenant_id)
+        )
+
+
+# ---- tournament members (大会参加メンバー) ----
+
+def next_tournament_player_number(tournament_id: int) -> int:
+    """受付順の自動採番用: 現在の最大選手番号+1を返す（未参加なら1）。"""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT COALESCE(MAX(player_number), 0) FROM tournament_members WHERE tournament_id = ?",
+            (tournament_id,),
+        )
+        return cur.fetchone()[0] + 1
+
+
+def add_tournament_member(tournament_id: int, member_id: int, player_number: int) -> int:
+    with get_connection() as conn:
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO tournament_members (tournament_id, member_id, player_number, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (tournament_id, member_id, player_number, _iso(_now())),
+            )
+        except sqlite3.IntegrityError as exc:
+            existing_numbers = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT player_number FROM tournament_members WHERE tournament_id = ?",
+                    (tournament_id,),
+                )
+            }
+            if player_number in existing_numbers:
+                raise PlayerNumberTakenError(player_number) from exc
+            raise MemberAlreadyRegisteredError(member_id) from exc
+        return cur.lastrowid
+
+
+def get_tournament_members(tournament_id: int) -> list[dict]:
+    """選手番号昇順。メンバー名も一緒に返す。"""
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            """
+            SELECT tm.id, tm.tournament_id, tm.member_id, tm.player_number, tm.created_at,
+                   m.name AS member_name
+            FROM tournament_members tm
+            JOIN members m ON m.id = tm.member_id
+            WHERE tm.tournament_id = ?
+            ORDER BY tm.player_number ASC
+            """,
+            (tournament_id,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+# ---- rounds / tables / seats / absences (回戦実施) ----
+
+def count_rounds(tournament_id: int) -> int:
+    with get_connection() as conn:
+        cur = conn.execute("SELECT COUNT(*) FROM rounds WHERE tournament_id = ?", (tournament_id,))
+        return cur.fetchone()[0]
+
+
+def get_rounds(tournament_id: int) -> list[dict]:
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            "SELECT id, tournament_id, round_number, created_at FROM rounds "
+            "WHERE tournament_id = ? ORDER BY round_number ASC",
+            (tournament_id,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+def save_round(tournament_id: int, round_number: int, tables: list[dict], absent_member_ids: list[int]) -> int:
+    """卓組み結果を確定保存する。
+
+    tables: [{"東": member_id, "南": member_id, "西": member_id, "北": member_id}, ...]
+    （table_logic.pyの戻り値をそのまま、選手番号→member_idに変換したもの）
+    round・卓・着席・抜け番のレコードをまとめて1トランザクションで作成する。
+    """
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO rounds (tournament_id, round_number, created_at) VALUES (?, ?, ?)",
+            (tournament_id, round_number, _iso(_now())),
+        )
+        round_id = cur.lastrowid
+        for table_number, table in enumerate(tables, start=1):
+            table_cur = conn.execute(
+                "INSERT INTO tables (round_id, table_number) VALUES (?, ?)",
+                (round_id, table_number),
+            )
+            table_id = table_cur.lastrowid
+            for position, member_id in table.items():
+                conn.execute(
+                    "INSERT INTO seats (table_id, member_id, position) VALUES (?, ?, ?)",
+                    (table_id, member_id, position),
+                )
+        for member_id in absent_member_ids:
+            conn.execute(
+                "INSERT INTO absences (round_id, member_id) VALUES (?, ?)",
+                (round_id, member_id),
+            )
+        return round_id
+
+
+def get_round_seats(round_id: int) -> list[dict]:
+    """[{"table_number":, "position":, "member_id":}, ...] を卓番号→着席順に返す。"""
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            """
+            SELECT t.table_number, s.position, s.member_id
+            FROM seats s
+            JOIN tables t ON t.id = s.table_id
+            WHERE t.round_id = ?
+            ORDER BY t.table_number ASC, s.id ASC
+            """,
+            (round_id,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+def get_round_absences(round_id: int) -> list[int]:
+    with get_connection() as conn:
+        cur = conn.execute("SELECT member_id FROM absences WHERE round_id = ?", (round_id,))
+        return [row[0] for row in cur.fetchall()]
+
+
+# ---- results (成績) ----
+
+def save_round_results(round_id: int, raw_scores: dict, tobi_busters: dict) -> None:
+    """素点と飛び賞の「誰が飛ばしたか」を保存する。
+
+    raw_scores: {member_id: 素点}
+    tobi_busters: {飛んだmember_id: [飛ばしたmember_id, ...]}
+    既存レコードがあれば削除してから入れ直す（成績入力の編集に対応するため）。
+    """
+    with get_connection() as conn:
+        conn.execute("DELETE FROM results WHERE round_id = ?", (round_id,))
+        conn.execute("DELETE FROM tobi_busters WHERE round_id = ?", (round_id,))
+        for member_id, raw_score in raw_scores.items():
+            conn.execute(
+                "INSERT INTO results (round_id, member_id, raw_score) VALUES (?, ?, ?)",
+                (round_id, member_id, raw_score),
+            )
+        for busted_member_id, busters in tobi_busters.items():
+            for buster_member_id in busters:
+                conn.execute(
+                    "INSERT INTO tobi_busters (round_id, busted_member_id, buster_member_id) VALUES (?, ?, ?)",
+                    (round_id, busted_member_id, buster_member_id),
+                )
+
+
+def get_round_results(round_id: int) -> dict:
+    with get_connection() as conn:
+        cur = conn.execute("SELECT member_id, raw_score FROM results WHERE round_id = ?", (round_id,))
+        return {row[0]: row[1] for row in cur.fetchall()}
+
+
+def get_round_tobi_busters(round_id: int) -> dict:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT busted_member_id, buster_member_id FROM tobi_busters WHERE round_id = ?",
+            (round_id,),
+        )
+        busters: dict[int, list[int]] = {}
+        for busted_member_id, buster_member_id in cur.fetchall():
+            busters.setdefault(busted_member_id, []).append(buster_member_id)
+        return busters
+
+
+# ---- ゲスト共有リンク ----
+# tenant_invitesと同じくtoken_hashのみ保存し、生トークンはDBに残さない。
+# 「発行済みならリンクを再表示」は、生成直後のst.session_state（招待リンクの
+# last_invite_linkと同じ扱い）でのみ可能。別セッションで再ログインした場合は
+# 「発行済みだが再表示はできない」旨を示し、必要なら再発行してもらう。
+
+def create_guest_link(tournament_id: int, created_by_user_id: int) -> str:
+    raw_token = _generate_token()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO tournament_guest_links
+                (tournament_id, token_hash, created_by_user_id, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (tournament_id, _hash_token(raw_token), created_by_user_id, _iso(_now())),
+        )
+    return raw_token
+
+
+def get_active_guest_link(tournament_id: int) -> dict | None:
+    """失効していない最新のゲストリンクのレコードを返す（存在確認・無効化操作用）。"""
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT * FROM tournament_guest_links
+            WHERE tournament_id = ? AND revoked_at IS NULL
+            ORDER BY id DESC LIMIT 1
+            """,
+            (tournament_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def revoke_guest_link(link_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE tournament_guest_links SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+            (_iso(_now()), link_id),
+        )
+
+
+def get_tournament_by_guest_token(raw_token: str) -> dict | None:
+    """有効なゲストトークンなら対応する大会情報を返す。失効・存在しないトークンならNone。"""
+    token_hash = _hash_token(raw_token)
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        link_row = conn.execute(
+            "SELECT tournament_id FROM tournament_guest_links WHERE token_hash = ? AND revoked_at IS NULL",
+            (token_hash,),
+        ).fetchone()
+        if link_row is None:
+            return None
+        tournament_row = conn.execute(
+            f"SELECT {_TOURNAMENT_COLUMNS} FROM tournaments WHERE id = ?",
+            (link_row["tournament_id"],),
+        ).fetchone()
+        return _row_to_tournament(tournament_row) if tournament_row else None
