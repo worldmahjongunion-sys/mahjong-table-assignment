@@ -1,4 +1,6 @@
 """得点ポイント評価方式実装依頼.md 4章「テスト」に対応するpytest。"""
+import pytest
+
 import scoring_logic as sl
 
 
@@ -256,3 +258,21 @@ def test_cumulative_points_tie_uses_score_then_player_number():
     cumulative_scores_tied = {9: 1000, 2: 1000, 15: 1000}
     ranking2 = sl.rank_by_points_then_score([9, 2, 15], cumulative_points, cumulative_scores_tied)
     assert ranking2 == [2, 9, 15]
+
+
+# ---------------------------------------------------------------------------
+# 順位付けは1卓（4人）ずつ行う（複数卓をまとめて渡すとエラーにする）
+# ---------------------------------------------------------------------------
+
+EIGHT_PLAYER_SCORES = {1: 50000, 2: 40000, 3: 30000, 4: 20000, 5: 8000, 6: 6000, 7: 4000, 8: 2000}
+
+
+def test_rank_points_rejects_more_than_one_table_of_players():
+    """5位以下が黙って0点になる代わりに、卓ごとに呼び出すべきことをエラーで知らせる。"""
+    with pytest.raises(ValueError):
+        sl.compute_rank_points(EIGHT_PLAYER_SCORES, [3, 1, -1, -3])
+
+
+def test_total_score_rejects_more_than_one_table_of_players():
+    with pytest.raises(ValueError):
+        sl.compute_total_score(EIGHT_PLAYER_SCORES, UMA_CONFIG)

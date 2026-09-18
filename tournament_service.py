@@ -81,32 +81,48 @@ def _extract_uma_config_and_tobi(scoring_config):
     return uma_config, tobi_amount
 
 
+def compute_round_totals(tournament, round_id):
+    """指定回戦の成績（素点）から、評価方式に応じた計算結果を返す（{member_id: 値}）。
+
+    順位付け（ウマ・オカ・飛び賞・順位ポイント）は卓ごとに行う。8人2卓の回戦なら、
+    卓1・卓2それぞれの中で1〜4位を決める。まだ成績が入力されていない卓は結果に含めない。
+    """
+    raw_scores = db.get_round_results(round_id)
+    if tournament["scoring_mode"] == "得点":
+        uma_config, tobi_amount = _extract_uma_config_and_tobi(tournament["scoring_config"])
+        tobi_busters = db.get_round_tobi_busters(round_id)
+    else:
+        point_table = tournament["scoring_config"]["rank_point_table"]
+
+    table_member_ids = {}
+    for seat in db.get_round_seats(round_id):
+        table_member_ids.setdefault(seat["table_number"], []).append(seat["member_id"])
+
+    round_values = {}
+    for member_ids in table_member_ids.values():
+        table_scores = {mid: raw_scores[mid] for mid in member_ids if mid in raw_scores}
+        if len(table_scores) < len(member_ids):
+            continue  # 未入力の卓（一部だけ入力された卓も、順位が決まらないので計算しない）
+        if tournament["scoring_mode"] == "得点":
+            table_busters = {mid: busters for mid, busters in tobi_busters.items() if mid in table_scores}
+            values = scoring_logic.compute_total_score(table_scores, uma_config, tobi_amount, table_busters)
+        else:
+            values = scoring_logic.compute_rank_points(table_scores, point_table)
+        round_values.update(values)
+    return round_values
+
+
 def build_cumulative_scores(tournament):
     """蛇行方式用: 評価方式に応じた累計得点／累計順位ポイントを選手番号キーで返す。
 
-    成績がまだ入力されていない回戦は寄与0として扱う（蛇行方式は次回戦の卓組みに
-    前回戦までの成績を使うため、直前の回戦の成績入力を済ませてから次回戦を
-    実行する運用を前提とする）。
+    各回戦の値は卓ごとに計算する（compute_round_totals）。成績がまだ入力されていない
+    卓・回戦は寄与0として扱う（蛇行方式は次回戦の卓組みに前回戦までの成績を使うため、
+    直前の回戦の成績入力を済ませてから次回戦を実行する運用を前提とする）。
     """
     member_to_number, _ = _player_number_map(tournament["id"])
     cumulative = {}
-    scoring_mode = tournament["scoring_mode"]
-    scoring_config = tournament["scoring_config"]
-    if scoring_mode == "得点":
-        uma_config, tobi_amount = _extract_uma_config_and_tobi(scoring_config)
-    else:
-        point_table = scoring_config["rank_point_table"]
-
     for round_row in db.get_rounds(tournament["id"]):
-        round_id = round_row["id"]
-        raw_scores = db.get_round_results(round_id)
-        if not raw_scores:
-            continue
-        if scoring_mode == "得点":
-            tobi_busters = db.get_round_tobi_busters(round_id)
-            round_values = scoring_logic.compute_total_score(raw_scores, uma_config, tobi_amount, tobi_busters)
-        else:
-            round_values = scoring_logic.compute_rank_points(raw_scores, point_table)
+        round_values = compute_round_totals(tournament, round_row["id"])
         round_values_by_number = {member_to_number[mid]: v for mid, v in round_values.items()}
         cumulative = scoring_logic.update_cumulative(cumulative, round_values_by_number)
     return cumulative
@@ -168,17 +184,6 @@ def save_confirmed_round(tournament_id, round_number, absent_player_numbers, tab
     ]
     absent_member_ids = [number_to_member[pn] for pn in absent_player_numbers]
     return db.save_round(tournament_id, round_number, tables_by_member, absent_member_ids)
-
-
-def compute_round_totals(tournament, round_id):
-    """指定回戦の成績（素点）から、評価方式に応じた計算結果を返す（{member_id: 値}）。"""
-    raw_scores = db.get_round_results(round_id)
-    if tournament["scoring_mode"] == "得点":
-        uma_config, tobi_amount = _extract_uma_config_and_tobi(tournament["scoring_config"])
-        tobi_busters = db.get_round_tobi_busters(round_id)
-        return scoring_logic.compute_total_score(raw_scores, uma_config, tobi_amount, tobi_busters)
-    point_table = tournament["scoring_config"]["rank_point_table"]
-    return scoring_logic.compute_rank_points(raw_scores, point_table)
 
 
 def compute_standings(tournament):

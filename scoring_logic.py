@@ -34,7 +34,15 @@ def _apply_placement_table(raw_scores, table):
     raw_scores: {選手番号: 素点}
     table: 1位から4位までの値のリスト（長さ4）
     戻り値: {選手番号: 割当値}
+
+    順位付けは1卓分（4人）の素点に対して行う。table_logic.pyの卓ごとに呼び出すこと。
+    複数卓ぶんをまとめて渡すとtableの長さを超えた順位に値が割り当てられず、
+    黙って0扱いになってしまうため、tableより多い人数はエラーにする。
     """
+    if len(raw_scores) > len(table):
+        raise ValueError(
+            f"順位付けは1卓ずつ行う必要があります（{len(raw_scores)}人分が渡されました。最大{len(table)}人）"
+        )
     ordered = sorted(raw_scores.keys(), key=lambda p: (-raw_scores[p], p))
     result = {}
     i = 0
