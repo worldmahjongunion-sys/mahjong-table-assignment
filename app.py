@@ -12,6 +12,7 @@ import streamlit_authenticator as stauth
 import db
 import exports
 import scoring_logic
+import tournament_service
 
 st.set_page_config(page_title="麻雀卓組みアプリ", page_icon="🀄")
 
@@ -28,6 +29,85 @@ def format_date_jp(iso_str: str | None) -> str:
         return "不明"
     dt = datetime.fromisoformat(iso_str)
     return f"{dt.year}年{dt.month}月{dt.day}日"
+
+
+def render_scoring_config_inputs(scoring_mode: str, key_prefix: str, defaults: dict | None = None) -> dict:
+    """評価方式(得点/ポイント)のパラメータ入力欄を描画し、入力値の辞書を返す。
+
+    表紙画面(519〜622行目付近)と同じ入力項目・初期値を、大会作成・編集フォームでも
+    再利用するための共通処理。key_prefixで呼び出しごとにウィジェットキーを一意化する。
+    """
+    defaults = defaults or {}
+    if scoring_mode == "得点":
+        default_uma_table = scoring_logic.DEFAULT_UMA_CONFIG["uma_table"]
+        saved_uma_table = defaults.get("uma_table", {})
+        start_point = st.number_input(
+            "開始点数（持ち点）",
+            value=defaults.get("start_point", scoring_logic.DEFAULT_UMA_CONFIG["start_point"]),
+            step=1000,
+            key=f"{key_prefix}_start_point",
+        )
+        return_point = st.number_input(
+            "返し点（オカの基準点）",
+            value=defaults.get("return_point", scoring_logic.DEFAULT_UMA_CONFIG["return_point"]),
+            step=1000,
+            key=f"{key_prefix}_return_point",
+        )
+        oka = st.number_input(
+            "オカ（0人浮き時にトップへ加算する額）",
+            value=defaults.get("oka", scoring_logic.DEFAULT_UMA_CONFIG["oka"]),
+            step=1000,
+            key=f"{key_prefix}_oka",
+        )
+        tobi_amount = st.number_input(
+            "飛び賞額（0なら飛び賞なし）",
+            value=defaults.get("tobi_amount", 0),
+            step=1000,
+            min_value=0,
+            key=f"{key_prefix}_tobi_amount",
+        )
+
+        st.caption("ウマ表（浮き人数別・4着分の順位点）")
+        uma_table_input = {}
+        for floating_count in (1, 2, 3):
+            st.write(f"{floating_count}人浮き")
+            default_row = saved_uma_table.get(floating_count, default_uma_table[floating_count])
+            cols = st.columns(4)
+            row = []
+            for i, col in enumerate(cols):
+                with col:
+                    row.append(
+                        st.number_input(
+                            f"{i + 1}着",
+                            value=default_row[i],
+                            step=1000,
+                            key=f"{key_prefix}_uma_{floating_count}_{i}",
+                        )
+                    )
+            uma_table_input[floating_count] = row
+
+        return {
+            "start_point": start_point,
+            "return_point": return_point,
+            "oka": oka,
+            "tobi_amount": tobi_amount,
+            "uma_table": uma_table_input,
+        }
+
+    default_rank_point_table = defaults.get("rank_point_table", scoring_logic.DEFAULT_RANK_POINT_TABLE)
+    st.caption("順位ポイント表（1〜4位）")
+    cols = st.columns(4)
+    rank_point_table_input = []
+    for i, col in enumerate(cols):
+        with col:
+            rank_point_table_input.append(
+                st.number_input(
+                    f"{i + 1}位",
+                    value=default_rank_point_table[i],
+                    key=f"{key_prefix}_rank_point_{i}",
+                )
+            )
+    return {"rank_point_table": rank_point_table_input}
 
 
 def get_auth_setting(env_var: str, secrets_key: str) -> str:
@@ -852,4 +932,399 @@ else:
                     st.rerun()
                 if confirm_cols[1].button("キャンセル", key=f"cancel_delete_{member['id']}"):
                     st.session_state[delete_key] = False
+                    st.rerun()
+
+# ---- 大会管理・回戦実施・ゲスト共有リンク ----
+# 大会管理とゲスト共有リンク実装依頼.md Stage 1対応。ログイン必須(主催者向け)。
+# ゲスト自身が使う閲覧・入力画面(トークン付きURLでのアクセス)はStage 2で対応する。
+st.divider()
+st.header("大会管理")
+
+if not is_admin:
+    st.info("大会の作成・編集・削除・回戦実施は管理者のみ行えます。一覧の閲覧はできます。")
+else:
+    with st.expander("新しい大会を作成"):
+        new_name = st.text_input("大会名", key="new_tournament_name")
+        new_kind = st.selectbox("種別", db.TOURNAMENT_KINDS, key="new_tournament_kind")
+        new_table_method = st.selectbox("卓組み方式", db.TABLE_METHODS, key="new_tournament_table_method")
+        new_scoring_mode = st.selectbox("評価方式", db.SCORING_MODES, key="new_tournament_scoring_mode")
+        new_numbering_method = st.selectbox(
+            "選手番号の採番方式", db.NUMBERING_METHODS, key="new_tournament_numbering_method"
+        )
+        col_start, col_end = st.columns(2)
+        with col_start:
+            new_start_date = st.text_input("開始日（任意、例: 2026-10-01）", key="new_tournament_start_date")
+        with col_end:
+            new_end_date = st.text_input("終了日（任意）", key="new_tournament_end_date")
+
+        with st.form("new_tournament_form"):
+            new_scoring_config = render_scoring_config_inputs(new_scoring_mode, "new_tournament")
+            create_submitted = st.form_submit_button("大会を作成")
+            if create_submitted:
+                if not new_name.strip():
+                    st.error("大会名を入力してください。")
+                else:
+                    tournament_id = db.create_tournament(
+                        tenant_id,
+                        new_name.strip(),
+                        new_kind,
+                        new_table_method,
+                        new_scoring_mode,
+                        new_scoring_config,
+                        new_numbering_method,
+                        start_date=new_start_date or None,
+                        end_date=new_end_date or None,
+                    )
+                    db.record_audit_log(
+                        action="tournament_create",
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        username=current_user["username"],
+                        detail=f"tournament_id={tournament_id}, name={new_name}",
+                    )
+                    st.success(f"「{new_name}」を作成しました。")
+                    st.rerun()
+
+st.subheader("大会一覧")
+
+tournaments = db.get_tournaments(tenant_id)
+if not tournaments:
+    st.info("大会がまだありません。")
+
+for tournament in tournaments:
+    tournament_id = tournament["id"]
+    with st.expander(f"{tournament['name']}（{tournament['status']}・{tournament['table_method']}・{tournament['scoring_mode']}評価）"):
+        st.write(
+            f"種別: {tournament['kind']} / 選手番号採番: {tournament['numbering_method']} / "
+            f"期間: {tournament['start_date'] or '未設定'}〜{tournament['end_date'] or '未設定'}"
+        )
+
+        # ---- 編集・削除 ----
+        if is_admin:
+            with st.expander("大会情報を編集"):
+                edit_prefix = f"edit_tournament_{tournament_id}"
+                edit_name = st.text_input("大会名", value=tournament["name"], key=f"{edit_prefix}_name")
+                edit_kind = st.selectbox(
+                    "種別", db.TOURNAMENT_KINDS,
+                    index=db.TOURNAMENT_KINDS.index(tournament["kind"]), key=f"{edit_prefix}_kind",
+                )
+                edit_table_method = st.selectbox(
+                    "卓組み方式", db.TABLE_METHODS,
+                    index=db.TABLE_METHODS.index(tournament["table_method"]), key=f"{edit_prefix}_table_method",
+                )
+                edit_scoring_mode = st.selectbox(
+                    "評価方式", db.SCORING_MODES,
+                    index=db.SCORING_MODES.index(tournament["scoring_mode"]), key=f"{edit_prefix}_scoring_mode",
+                )
+                edit_numbering_method = st.selectbox(
+                    "選手番号の採番方式", db.NUMBERING_METHODS,
+                    index=db.NUMBERING_METHODS.index(tournament["numbering_method"]),
+                    key=f"{edit_prefix}_numbering_method",
+                )
+                edit_status = st.selectbox(
+                    "状態", db.TOURNAMENT_STATUSES,
+                    index=db.TOURNAMENT_STATUSES.index(tournament["status"]), key=f"{edit_prefix}_status",
+                )
+                col_edit_start, col_edit_end = st.columns(2)
+                with col_edit_start:
+                    edit_start_date = st.text_input(
+                        "開始日", value=tournament["start_date"] or "", key=f"{edit_prefix}_start_date"
+                    )
+                with col_edit_end:
+                    edit_end_date = st.text_input(
+                        "終了日", value=tournament["end_date"] or "", key=f"{edit_prefix}_end_date"
+                    )
+
+                with st.form(f"{edit_prefix}_form"):
+                    edit_scoring_config = render_scoring_config_inputs(
+                        edit_scoring_mode,
+                        edit_prefix,
+                        defaults=tournament["scoring_config"] if edit_scoring_mode == tournament["scoring_mode"] else None,
+                    )
+                    edit_submitted = st.form_submit_button("変更を保存")
+                    if edit_submitted:
+                        if not edit_name.strip():
+                            st.error("大会名を入力してください。")
+                        else:
+                            db.update_tournament(
+                                tenant_id, tournament_id, edit_name.strip(), edit_kind,
+                                edit_table_method, edit_scoring_mode, edit_scoring_config,
+                                edit_numbering_method, edit_start_date or None, edit_end_date or None,
+                                edit_status,
+                            )
+                            st.success("大会情報を更新しました。")
+                            st.rerun()
+
+            delete_confirm_key = f"delete_tournament_confirm_{tournament_id}"
+            if st.button("この大会を削除", key=f"delete_tournament_btn_{tournament_id}"):
+                st.session_state[delete_confirm_key] = True
+            if st.session_state.get(delete_confirm_key):
+                st.warning(
+                    f"「{tournament['name']}」を削除します。回戦・成績・ゲストリンクもすべて削除され、元に戻せません。よろしいですか？"
+                )
+                confirm_delete_cols = st.columns(2)
+                if confirm_delete_cols[0].button("はい、削除する", key=f"confirm_delete_tournament_{tournament_id}"):
+                    db.delete_tournament(tenant_id, tournament_id)
+                    db.record_audit_log(
+                        action="tournament_delete",
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        username=current_user["username"],
+                        detail=f"tournament_id={tournament_id}, name={tournament['name']}",
+                    )
+                    st.session_state[delete_confirm_key] = False
+                    st.success("削除しました。")
+                    st.rerun()
+                if confirm_delete_cols[1].button("キャンセル", key=f"cancel_delete_tournament_{tournament_id}"):
+                    st.session_state[delete_confirm_key] = False
+                    st.rerun()
+
+        st.divider()
+
+        # ---- 参加メンバー ----
+        st.write("**参加メンバー**")
+        tournament_members = db.get_tournament_members(tournament_id)
+        if tournament_members:
+            st.table(
+                [
+                    {"選手番号": tm["player_number"], "氏名": tm["member_name"]}
+                    for tm in tournament_members
+                ]
+            )
+        else:
+            st.caption("参加メンバーがまだいません。")
+
+        if is_admin:
+            registered_member_ids = {tm["member_id"] for tm in tournament_members}
+            candidate_members = [m for m in db.get_members(tenant_id, order="name") if m["id"] not in registered_member_ids]
+            if candidate_members:
+                with st.expander("参加メンバーを追加"):
+                    selected_member_ids = []
+                    for member in candidate_members:
+                        checked = st.checkbox(
+                            member["name"], key=f"add_participant_{tournament_id}_{member['id']}"
+                        )
+                        if checked:
+                            selected_member_ids.append(member["id"])
+
+                    manual_numbers: dict[int, int] = {}
+                    if tournament["numbering_method"] == "くじ引き":
+                        for member_id in selected_member_ids:
+                            member_name = next(m["name"] for m in candidate_members if m["id"] == member_id)
+                            manual_numbers[member_id] = st.number_input(
+                                f"「{member_name}」の選手番号（くじ引き）",
+                                min_value=1,
+                                step=1,
+                                key=f"player_number_{tournament_id}_{member_id}",
+                            )
+
+                    if selected_member_ids and st.button(
+                        "選択したメンバーを追加", key=f"confirm_add_participants_{tournament_id}"
+                    ):
+                        errors = []
+                        for member_id in selected_member_ids:
+                            try:
+                                if tournament["numbering_method"] == "受付順":
+                                    player_number = db.next_tournament_player_number(tournament_id)
+                                else:
+                                    player_number = int(manual_numbers[member_id])
+                                db.add_tournament_member(tournament_id, member_id, player_number)
+                            except db.PlayerNumberTakenError:
+                                errors.append(f"選手番号 {manual_numbers.get(member_id)} は既に使われています。")
+                            except db.MemberAlreadyRegisteredError:
+                                errors.append("既に参加登録済みのメンバーです。")
+                        if errors:
+                            for err in errors:
+                                st.error(err)
+                        else:
+                            st.success("参加メンバーを追加しました。")
+                        st.rerun()
+
+        st.divider()
+
+        # ---- 回戦実行 ----
+        st.write("**回戦実行**")
+        preview_key = f"round_preview_{tournament_id}"
+
+        if is_admin:
+            if len(tournament_members) < 4:
+                st.caption("卓組みを実行するには、参加メンバーが4人以上必要です。")
+            else:
+                col_run, col_reroll = st.columns(2)
+                if col_run.button("次の回戦の卓組みを実行", key=f"run_round_{tournament_id}"):
+                    round_number, absent, tables = tournament_service.run_next_round(tournament)
+                    st.session_state[preview_key] = {
+                        "round_number": round_number,
+                        "absent": absent,
+                        "tables": tables,
+                    }
+                    st.rerun()
+                if st.session_state.get(preview_key) and col_reroll.button(
+                    "作り直す（乱数を引き直す）", key=f"reroll_round_{tournament_id}"
+                ):
+                    round_number, absent, tables = tournament_service.run_next_round(tournament)
+                    st.session_state[preview_key] = {
+                        "round_number": round_number,
+                        "absent": absent,
+                        "tables": tables,
+                    }
+                    st.rerun()
+
+        preview = st.session_state.get(preview_key)
+        if preview:
+            player_number_to_name = {
+                tm["player_number"]: tm["member_name"] for tm in tournament_members
+            }
+            st.write(f"第{preview['round_number']}回戦のプレビュー（未保存）")
+            for table_number, table in enumerate(preview["tables"], start=1):
+                seat_line = "　".join(
+                    f"{position}: {player_number_to_name.get(player_number, player_number)}"
+                    for position, player_number in table.items()
+                )
+                st.write(f"卓{table_number}: {seat_line}")
+            if preview["absent"]:
+                absent_names = "、".join(
+                    player_number_to_name.get(pn, str(pn)) for pn in preview["absent"]
+                )
+                st.write(f"抜け番: {absent_names}")
+            else:
+                st.write("抜け番: なし")
+
+            if is_admin and st.button("この結果で保存", key=f"save_round_{tournament_id}"):
+                tournament_service.save_confirmed_round(
+                    tournament_id, preview["round_number"], preview["absent"], preview["tables"]
+                )
+                db.record_audit_log(
+                    action="round_save",
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    username=current_user["username"],
+                    detail=f"tournament_id={tournament_id}, round_number={preview['round_number']}",
+                )
+                st.session_state.pop(preview_key, None)
+                st.success("回戦結果を保存しました。")
+                st.rerun()
+
+        st.divider()
+
+        # ---- 成績入力 ----
+        st.write("**成績入力**")
+        rounds = db.get_rounds(tournament_id)
+        if not rounds:
+            st.caption("まだ回戦がありません。")
+        else:
+            round_options = {r["round_number"]: r["id"] for r in rounds}
+            selected_round_number = st.selectbox(
+                "回戦を選択", options=list(round_options.keys()), key=f"score_round_select_{tournament_id}"
+            )
+            selected_round_id = round_options[selected_round_number]
+            seats = db.get_round_seats(selected_round_id)
+            existing_scores = db.get_round_results(selected_round_id)
+            existing_busters = db.get_round_tobi_busters(selected_round_id)
+            member_id_to_name = {tm["member_id"]: tm["member_name"] for tm in tournament_members}
+
+            by_table: dict[int, list] = {}
+            for seat in seats:
+                by_table.setdefault(seat["table_number"], []).append(seat)
+
+            raw_scores_input = {}
+            tobi_busters_input = {}
+            for table_number, table_seats in sorted(by_table.items()):
+                st.write(f"卓{table_number}")
+                score_cols = st.columns(4)
+                table_member_ids = [s["member_id"] for s in table_seats]
+                for col, seat in zip(score_cols, table_seats):
+                    with col:
+                        member_id = seat["member_id"]
+                        score = st.number_input(
+                            f"{member_id_to_name.get(member_id, member_id)}（{seat['position']}）",
+                            value=existing_scores.get(member_id, 0),
+                            step=100,
+                            key=f"score_{selected_round_id}_{member_id}",
+                        )
+                        raw_scores_input[member_id] = score
+                for seat in table_seats:
+                    member_id = seat["member_id"]
+                    if raw_scores_input[member_id] <= 0:
+                        other_member_ids = [m for m in table_member_ids if m != member_id]
+                        default_busters = [b for b in existing_busters.get(member_id, []) if b in other_member_ids]
+                        chosen_busters = st.multiselect(
+                            f"「{member_id_to_name.get(member_id, member_id)}」を飛ばした人",
+                            options=other_member_ids,
+                            default=default_busters,
+                            format_func=lambda m: member_id_to_name.get(m, m),
+                            key=f"busters_{selected_round_id}_{member_id}",
+                        )
+                        if chosen_busters:
+                            tobi_busters_input[member_id] = chosen_busters
+
+            if is_admin and st.button("成績を保存", key=f"save_results_{selected_round_id}"):
+                db.save_round_results(selected_round_id, raw_scores_input, tobi_busters_input)
+                st.success("成績を保存しました。")
+                st.rerun()
+
+            if existing_scores:
+                totals = tournament_service.compute_round_totals(tournament, selected_round_id)
+                st.caption("この回戦の計算結果（" + ("総合得点" if tournament["scoring_mode"] == "得点" else "順位ポイント") + "）")
+                st.table(
+                    [
+                        {"氏名": member_id_to_name.get(mid, mid), "値": value}
+                        for mid, value in sorted(totals.items(), key=lambda kv: -kv[1])
+                    ]
+                )
+
+        # ---- 大会内順位表 ----
+        if rounds:
+            st.write("**大会内順位表**")
+            standings = tournament_service.compute_standings(tournament)
+            member_id_to_name_all = {tm["member_id"]: tm["member_name"] for tm in tournament_members}
+            st.table(
+                [
+                    {
+                        "順位": i + 1,
+                        "選手番号": row["player_number"],
+                        "氏名": member_id_to_name_all.get(row["member_id"], row["member_id"]),
+                        "値": row["value"],
+                    }
+                    for i, row in enumerate(standings)
+                ]
+            )
+
+        st.divider()
+
+        # ---- ゲスト共有リンク ----
+        st.write("**ゲスト共有リンク**")
+        st.caption(
+            "リンクを知っている人は、アカウント作成なしでこの大会の卓組み結果・成績を閲覧・入力できます"
+            "（ゲスト向け画面自体はStage 2で実装予定）。"
+        )
+        active_link = db.get_active_guest_link(tournament_id)
+        guest_token_key = f"guest_link_raw_{tournament_id}"
+
+        if is_admin:
+            if active_link is None:
+                if st.button("ゲスト用リンクを発行", key=f"issue_guest_link_{tournament_id}"):
+                    raw_token = db.create_guest_link(tournament_id, user_id)
+                    st.session_state[guest_token_key] = raw_token
+                    st.rerun()
+            else:
+                st.success("ゲスト共有リンクは発行済みです。")
+                raw_token = st.session_state.get(guest_token_key)
+                if raw_token:
+                    st.code(f"{APP_BASE_URL}/?guest={raw_token}")
+                else:
+                    st.caption(
+                        "このブラウザセッションで発行したリンクではないため、文字列は再表示できません"
+                        "（生トークンはDBに保存していません）。共有し忘れた場合は下から再発行してください。"
+                    )
+                link_action_cols = st.columns(2)
+                if link_action_cols[0].button("リンクを再発行する（旧リンクは失効）", key=f"reissue_guest_link_{tournament_id}"):
+                    db.revoke_guest_link(active_link["id"])
+                    raw_token = db.create_guest_link(tournament_id, user_id)
+                    st.session_state[guest_token_key] = raw_token
+                    st.rerun()
+                if link_action_cols[1].button("リンクを無効化する", key=f"revoke_guest_link_{tournament_id}"):
+                    db.revoke_guest_link(active_link["id"])
+                    st.session_state.pop(guest_token_key, None)
+                    st.success("ゲスト共有リンクを無効化しました。")
                     st.rerun()

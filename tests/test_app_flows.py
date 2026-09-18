@@ -259,7 +259,10 @@ def test_choosing_points_mode_shows_rank_point_form_with_defaults_and_saves(app_
     at.button[_find_button(at, "②ポイントで評価")].click().run()
     assert not at.exception
     assert any("現在の評価方式" in md.value and "②ポイントで評価" in md.value for md in at.markdown)
-    assert [ni.value for ni in at.number_input] == [3, 1, -1, -3]
+    rank_point_values = [
+        ni.value for ni in at.number_input if ni.label in ("1位", "2位", "3位", "4位")
+    ]
+    assert rank_point_values == [3, 1, -1, -3]
 
     at.button[_find_button(at, "設定を保存")].click().run()
     assert not at.exception
