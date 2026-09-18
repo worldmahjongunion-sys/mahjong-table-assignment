@@ -11,6 +11,7 @@ import streamlit_authenticator as stauth
 
 import db
 import exports
+import scoring_logic
 
 st.set_page_config(page_title="麻雀卓組みアプリ", page_icon="🀄")
 
@@ -505,6 +506,120 @@ if not current_user["email_verified"]:
             )
             st.info("確認メールを再送しました。")
     st.stop()
+
+# ---- 表紙画面（評価方式の選択） ----
+# 得点ポイント評価方式実装依頼.md 3.3対応。大会管理・回戦実施画面(Phase 3・4)が
+# まだ無いため、選んだ評価方式と入力値の保存先は今回はst.session_stateのみとする
+# (大会ごとのDB保存はそれぞれのフェーズの実装時に行う)。
+st.divider()
+st.subheader("📋 評価方式")
+
+if not st.session_state.get("scoring_mode"):
+    st.write("このアプリでの成績評価方式を選んでください。")
+    col_score, col_points = st.columns(2)
+    with col_score:
+        if st.button("①得点で評価", width="stretch"):
+            st.session_state["scoring_mode"] = "score"
+            st.rerun()
+    with col_points:
+        if st.button("②ポイントで評価", width="stretch"):
+            st.session_state["scoring_mode"] = "points"
+            st.rerun()
+else:
+    scoring_mode = st.session_state["scoring_mode"]
+    scoring_mode_label = "①得点で評価" if scoring_mode == "score" else "②ポイントで評価"
+    st.write(f"現在の評価方式: **{scoring_mode_label}**")
+
+    saved_scoring_config = st.session_state.get("scoring_config", {})
+
+    if scoring_mode == "score":
+        default_uma_table = scoring_logic.DEFAULT_UMA_CONFIG["uma_table"]
+        saved_uma_table = saved_scoring_config.get("uma_table", {})
+        with st.form("scoring_config_score_form"):
+            start_point = st.number_input(
+                "開始点数（持ち点）",
+                value=saved_scoring_config.get(
+                    "start_point", scoring_logic.DEFAULT_UMA_CONFIG["start_point"]
+                ),
+                step=1000,
+                key="scoring_start_point",
+            )
+            return_point = st.number_input(
+                "返し点（オカの基準点）",
+                value=saved_scoring_config.get(
+                    "return_point", scoring_logic.DEFAULT_UMA_CONFIG["return_point"]
+                ),
+                step=1000,
+                key="scoring_return_point",
+            )
+            oka = st.number_input(
+                "オカ（0人浮き時にトップへ加算する額）",
+                value=saved_scoring_config.get("oka", scoring_logic.DEFAULT_UMA_CONFIG["oka"]),
+                step=1000,
+                key="scoring_oka",
+            )
+            tobi_amount = st.number_input(
+                "飛び賞額（0なら飛び賞なし）",
+                value=saved_scoring_config.get("tobi_amount", 0),
+                step=1000,
+                min_value=0,
+                key="scoring_tobi_amount",
+            )
+
+            st.caption("ウマ表（浮き人数別・4着分の順位点）")
+            uma_table_input = {}
+            for floating_count in (1, 2, 3):
+                st.write(f"{floating_count}人浮き")
+                default_row = saved_uma_table.get(floating_count, default_uma_table[floating_count])
+                cols = st.columns(4)
+                row = []
+                for i, col in enumerate(cols):
+                    with col:
+                        row.append(
+                            st.number_input(
+                                f"{i + 1}着",
+                                value=default_row[i],
+                                step=1000,
+                                key=f"uma_{floating_count}_{i}",
+                            )
+                        )
+                uma_table_input[floating_count] = row
+
+            score_submitted = st.form_submit_button("設定を保存", key="scoring_score_submit")
+            if score_submitted:
+                st.session_state["scoring_config"] = {
+                    "start_point": start_point,
+                    "return_point": return_point,
+                    "oka": oka,
+                    "tobi_amount": tobi_amount,
+                    "uma_table": uma_table_input,
+                }
+                st.success("設定を保存しました。")
+    else:
+        default_rank_point_table = saved_scoring_config.get(
+            "rank_point_table", scoring_logic.DEFAULT_RANK_POINT_TABLE
+        )
+        with st.form("scoring_config_points_form"):
+            st.caption("順位ポイント表（1〜4位）")
+            cols = st.columns(4)
+            rank_point_table_input = []
+            for i, col in enumerate(cols):
+                with col:
+                    rank_point_table_input.append(
+                        st.number_input(
+                            f"{i + 1}位",
+                            value=default_rank_point_table[i],
+                            key=f"rank_point_{i}",
+                        )
+                    )
+            points_submitted = st.form_submit_button("設定を保存", key="scoring_points_submit")
+            if points_submitted:
+                st.session_state["scoring_config"] = {"rank_point_table": rank_point_table_input}
+                st.success("設定を保存しました。")
+
+    if st.button("評価方式を選び直す"):
+        st.session_state["scoring_mode"] = None
+        st.rerun()
 
 # ---- 運営専用画面 ----
 # is_operator は OPERATOR_USERNAMES（環境変数/secrets）に載っているユーザー名だけが

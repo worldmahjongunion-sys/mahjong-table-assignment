@@ -200,3 +200,85 @@ def test_export_buttons_enabled_for_admin_on_pro_plan(app_env):
     download_buttons = [b for b in at.download_button if "ダウンロード" in b.label]
     assert len(download_buttons) == 2
     assert all(not b.disabled for b in download_buttons)
+
+
+# ---- 表紙画面（評価方式の選択） ----
+# 得点ポイント評価方式実装依頼.md 3.3対応。
+
+
+def _find_number_input(at, label_substr):
+    for i, ni in enumerate(at.number_input):
+        if label_substr in ni.label:
+            return i
+    raise ValueError(f"number_input not found: {label_substr}")
+
+
+def test_cover_screen_shows_two_choice_buttons_before_a_mode_is_picked(app_env):
+    _add_user("admin1", "adminpass123", email="admin1@example.com")
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+
+    assert not at.exception
+    assert any("①得点で評価" in b.label for b in at.button)
+    assert any("②ポイントで評価" in b.label for b in at.button)
+    assert not any("現在の評価方式" in md.value for md in at.markdown)
+
+
+def test_choosing_score_mode_shows_uma_form_with_defaults_and_saves(app_env):
+    _add_user("admin1", "adminpass123", email="admin1@example.com")
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+
+    at.button[_find_button(at, "①得点で評価")].click().run()
+    assert not at.exception
+    assert any("現在の評価方式" in md.value and "①得点で評価" in md.value for md in at.markdown)
+
+    # プレースホルダはscoring_logic.DEFAULT_UMA_CONFIGの参考値が入っている
+    assert at.number_input[_find_number_input(at, "開始点数")].value == 35000
+    assert at.number_input[_find_number_input(at, "返し点")].value == 40000
+
+    at.button[_find_button(at, "設定を保存")].click().run()
+    assert not at.exception
+    config = at.session_state["scoring_config"]
+    assert config["start_point"] == 35000
+    assert config["return_point"] == 40000
+    assert config["uma_table"][1] == [48000, -8000, -16000, -24000]
+
+
+def test_choosing_points_mode_shows_rank_point_form_with_defaults_and_saves(app_env):
+    _add_user("admin1", "adminpass123", email="admin1@example.com")
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+
+    at.button[_find_button(at, "②ポイントで評価")].click().run()
+    assert not at.exception
+    assert any("現在の評価方式" in md.value and "②ポイントで評価" in md.value for md in at.markdown)
+    assert [ni.value for ni in at.number_input] == [3, 1, -1, -3]
+
+    at.button[_find_button(at, "設定を保存")].click().run()
+    assert not at.exception
+    config = at.session_state["scoring_config"]
+    assert config["rank_point_table"] == [3, 1, -1, -3]
+
+
+def test_reset_button_returns_to_choice_screen(app_env):
+    _add_user("admin1", "adminpass123", email="admin1@example.com")
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+
+    at.button[_find_button(at, "①得点で評価")].click().run()
+    at.button[_find_button(at, "設定を保存")].click().run()
+    at.button[_find_button(at, "評価方式を選び直す")].click().run()
+
+    assert not at.exception
+    assert any("①得点で評価" in b.label for b in at.button)
+    assert any("②ポイントで評価" in b.label for b in at.button)
+    assert at.session_state["scoring_mode"] is None
