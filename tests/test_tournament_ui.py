@@ -138,7 +138,7 @@ def test_admin_can_enter_round_results(app_env):
 
     score_inputs = [ni for ni in at.number_input if ni.key and ni.key.startswith("score_")]
     assert len(score_inputs) == 4
-    scores = [50000, 20000, 15000, -5000]
+    scores = [70000, 50000, 25000, -5000]  # 合計140000(開始点数35000×4)
     for ni, score in zip(score_inputs, scores):
         ni.set_value(score)
     at.run()
@@ -181,7 +181,7 @@ def test_admin_saving_one_table_does_not_zero_out_untouched_table(app_env):
     table2_member_ids = {s["member_id"] for s in seats if s["table_number"] == 2}
 
     # 卓1だけ入力し、卓2は初期値0のまま何も触らない
-    table1_scores = [40000, 30000, 20000, 10000]
+    table1_scores = [60000, 40000, 30000, 10000]  # 合計140000(開始点数35000×4)
     i = 0
     for ni in score_inputs:
         member_id = int(ni.key.rsplit("_", 1)[1])
@@ -469,3 +469,115 @@ def test_guest_view_blocks_score_entry_when_start_point_missing(app_env):
     assert any("開始点数を設定するまで入力できません" in w.value for w in at.warning)
     score_inputs = [ni for ni in at.number_input if ni.key and ni.key.startswith("guest_score_")]
     assert len(score_inputs) == 0
+
+
+# ---------------------------------------------------------------------------
+# 主催者の成績保存: 卓ごとの合計チェック(ゲスト向け画面実装依頼_Stage2.md 3.5)・表示整形
+# ---------------------------------------------------------------------------
+
+def _setup_two_table_round(scoring_mode="得点", scoring_config=SCORE_CONFIG):
+    """8人・2卓の第1回戦を保存し、(tenant_id, tournament_id, round_id, 卓1のmember_id, 卓2のmember_id)を返す。"""
+    user_id = _add_user("admin1", "adminpass123", email="admin1@example.com")
+    tenant_id = db.get_user_by_id(user_id)["tenant_id"]
+    member_ids = [db.add_member(tenant_id, user_id, f"選手{i}", "") for i in range(8)]
+    tournament_id = db.create_tournament(
+        tenant_id, "テスト大会", "ワンデー", "蛇行", scoring_mode, scoring_config, "受付順"
+    )
+    for i, member_id in enumerate(member_ids, start=1):
+        db.add_tournament_member(tournament_id, member_id, i)
+    tournament = db.get_tournament(tenant_id, tournament_id)
+    round_number, absent, tables = svc.run_next_round(tournament)
+    round_id = svc.save_confirmed_round(tournament_id, round_number, absent, tables)
+    seats = db.get_round_seats(round_id)
+    table1 = [s["member_id"] for s in seats if s["table_number"] == 1]
+    table2 = [s["member_id"] for s in seats if s["table_number"] == 2]
+    return tenant_id, tournament_id, round_id, table1, table2
+
+
+def _set_admin_scores(at, scores_by_member):
+    for ni in at.number_input:
+        if ni.key and ni.key.startswith("score_"):
+            member_id = int(ni.key.rsplit("_", 1)[1])
+            if member_id in scores_by_member:
+                ni.set_value(scores_by_member[member_id])
+    at.run()
+
+
+def test_admin_save_blocked_when_a_table_total_is_off_by_one(app_env):
+    """卓1はぴったり、卓2は1点ずれ: ずれた卓だけを赤字で示し、保存全体を止める
+    （ぴったりの卓1も保存されない）。"""
+    _, tournament_id, round_id, table1, table2 = _setup_two_table_round()
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+    _set_admin_scores(at, {
+        **dict(zip(table1, (70000, 50000, 25000, -5000))),  # 合計140000
+        **dict(zip(table2, (60000, 40000, 30000, 9999))),   # 合計139999
+    })
+
+    error_texts = [e.value for e in at.error]
+    assert any("卓2の合計が 139,999 点です" in t and "140,000 点" in t for t in error_texts)
+    assert not any("卓1の合計が" in t for t in error_texts)  # 卓1は赤字にならない
+
+    at.button[_find_button(at, "成績を保存")].click().run()
+    assert not at.exception
+    assert any("保存できません" in e.value and "卓2" in e.value for e in at.error)
+    assert db.get_round_results(round_id) == {}  # 何も保存されない
+
+
+def test_admin_save_accepts_every_table_exactly_at_start_point_times_four(app_env):
+    _, tournament_id, round_id, table1, table2 = _setup_two_table_round()
+    scores = {
+        **dict(zip(table1, (70000, 50000, 25000, -5000))),
+        **dict(zip(table2, (60000, 40000, 30000, 10000))),
+    }
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+    _set_admin_scores(at, scores)
+
+    assert not any("の合計が" in e.value for e in at.error)
+    at.button[_find_button(at, "成績を保存")].click().run()
+
+    assert not at.exception
+    assert db.get_round_results(round_id) == scores
+    meta = db.get_round_result_meta(round_id)
+    assert all(m["input_source"] == "admin" for m in meta.values())
+
+
+def test_admin_correction_of_saved_table_is_also_checked(app_env):
+    """保存済みの卓の修正(3.5)にも同じ合計チェックがかかり、不一致なら既存の値は変わらない。"""
+    _, tournament_id, round_id, table1, table2 = _setup_two_table_round()
+    original = dict(zip(table1, (70000, 50000, 25000, -5000)))
+    db.save_round_results(round_id, original, {})
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+    _set_admin_scores(at, {table1[0]: 71000})  # 合計141000になる修正
+
+    assert any("卓1の合計が 141,000 点です" in e.value for e in at.error)
+    assert not any("卓2の合計が" in e.value for e in at.error)  # 未入力の卓2は対象外
+    at.button[_find_button(at, "成績を保存")].click().run()
+
+    assert db.get_round_results(round_id) == original
+
+
+def test_admin_save_blocked_when_start_point_is_missing(app_env):
+    """開始点数が未設定の大会(既存のポイント方式大会など)では、ゲスト画面と同じく成績を保存できない。"""
+    _, tournament_id, round_id, table1, table2 = _setup_two_table_round(
+        scoring_mode="ポイント", scoring_config={"rank_point_table": [3, 1, -1, -3]}
+    )
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+    assert any("開始点数が未設定" in w.value for w in at.warning)
+    _set_admin_scores(at, dict(zip(table1, (70000, 50000, 25000, -5000))))
+
+    at.button[_find_button(at, "成績を保存")].click().run()
+
+    assert any("開始点数が未設定" in e.value for e in at.error)
+    assert db.get_round_results(round_id) == {}

@@ -1394,8 +1394,27 @@ for tournament in tournaments:
             for seat in seats:
                 by_table.setdefault(seat["table_number"], []).append(seat)
 
+            start_point = tournament["scoring_config"].get("start_point")
+            if start_point is None:
+                st.warning(
+                    "開始点数が未設定のため、成績を保存できません。大会設定で開始点数を設定してください。"
+                )
+            expected_total = start_point * 4 if start_point is not None else None
+
             raw_scores_input = {}
             tobi_busters_input = {}
+            # このフォームは回戦内の全卓をまとめて表示するため、まだ誰も入力していない
+            # (＝ゲストもまだ入力していない)卓の入力欄は初期値の0のままになっている。
+            # フィルタせずに保存すると、その卓の全員分が0点として保存されてしまい、
+            # (1)実際には未入力の卓に虚偽の0点記録が残る、
+            # (2)resultsのUNIQUE(round_id, member_id)制約により、後でゲストが
+            #    submit_guest_round_resultsで本来の素点を送信しようとしても
+            #    「すでに入力済み」として拒否されてしまう、という問題が起きる。
+            # そのため、既存レコードがある(＝既に入力済み)卓か、今回いずれかの選手の
+            # 値が0以外に変更された(＝この保存で実際に入力しようとしている)卓だけを
+            # 保存対象(save_tables)にし、合計チェックもその卓にだけかける。
+            save_tables: dict[int, list[int]] = {}
+            mismatched_tables: list[int] = []
             for table_number, table_seats in sorted(by_table.items()):
                 st.write(f"卓{table_number}")
                 score_cols = st.columns(4)
@@ -1425,32 +1444,41 @@ for tournament in tournaments:
                         if chosen_busters:
                             tobi_busters_input[member_id] = chosen_busters
 
+                already_entered = any(mid in existing_scores for mid in table_member_ids)
+                touched = any(raw_scores_input[mid] != 0 for mid in table_member_ids)
+                if already_entered or touched:
+                    save_tables[table_number] = table_member_ids
+                    if expected_total is not None:
+                        table_total = sum(raw_scores_input[mid] for mid in table_member_ids)
+                        if table_total == expected_total:
+                            st.caption(f"卓{table_number}の合計 {table_total:,} 点")
+                        else:
+                            mismatched_tables.append(table_number)
+                            st.error(
+                                f"卓{table_number}の合計が {table_total:,} 点です。"
+                                f"{expected_total:,} 点になるよう確認してください。"
+                            )
+
             if is_admin and st.button("成績を保存", key=f"save_results_{selected_round_id}"):
-                # このフォームは回戦内の全卓をまとめて表示するため、まだ誰も入力していない
-                # (＝ゲストもまだ入力していない)卓の入力欄は初期値の0のままになっている。
-                # フィルタせずに保存すると、その卓の全員分が0点として保存されてしまい、
-                # (1)実際には未入力の卓に虚偽の0点記録が残る、
-                # (2)resultsのUNIQUE(round_id, member_id)制約により、後でゲストが
-                #    submit_guest_round_resultsで本来の素点を送信しようとしても
-                #    「すでに入力済み」として拒否されてしまう、という問題が起きる。
-                # そのため、既存レコードがある(＝既に入力済み)卓か、今回いずれかの選手の
-                # 値が0以外に変更された(＝この保存で実際に入力しようとしている)卓だけを
-                # 保存対象にする。
-                scores_to_save = {}
-                busters_to_save = {}
-                for table_number, table_seats in by_table.items():
-                    table_member_ids = [s["member_id"] for s in table_seats]
-                    already_entered = any(mid in existing_scores for mid in table_member_ids)
-                    touched = any(raw_scores_input[mid] != 0 for mid in table_member_ids)
-                    if not (already_entered or touched):
-                        continue
-                    for mid in table_member_ids:
-                        scores_to_save[mid] = raw_scores_input[mid]
-                        if mid in tobi_busters_input:
-                            busters_to_save[mid] = tobi_busters_input[mid]
-                db.save_round_results(selected_round_id, scores_to_save, busters_to_save)
-                st.success("成績を保存しました。")
-                st.rerun()
+                # 依頼書3.5: 主催者の保存(修正を含む)にも、ゲスト入力と同じ「卓ごとの素点合計＝
+                # 開始点数×4」のチェックをかける。ずれている卓は上で赤字表示済みなので、ここでは
+                # 保存を止めるだけにする。
+                if expected_total is None:
+                    st.error("開始点数が未設定のため保存できません。")
+                elif mismatched_tables:
+                    table_names = "、".join(f"卓{n}" for n in mismatched_tables)
+                    st.error(f"合計が {expected_total:,} 点になっていない卓があるため保存できません（{table_names}）。")
+                else:
+                    scores_to_save = {}
+                    busters_to_save = {}
+                    for table_member_ids in save_tables.values():
+                        for mid in table_member_ids:
+                            scores_to_save[mid] = raw_scores_input[mid]
+                            if mid in tobi_busters_input:
+                                busters_to_save[mid] = tobi_busters_input[mid]
+                    db.save_round_results(selected_round_id, scores_to_save, busters_to_save)
+                    st.success("成績を保存しました。")
+                    st.rerun()
 
             if existing_scores:
                 totals = tournament_service.compute_round_totals(tournament, selected_round_id)
