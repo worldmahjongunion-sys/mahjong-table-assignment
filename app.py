@@ -1426,7 +1426,29 @@ for tournament in tournaments:
                             tobi_busters_input[member_id] = chosen_busters
 
             if is_admin and st.button("成績を保存", key=f"save_results_{selected_round_id}"):
-                db.save_round_results(selected_round_id, raw_scores_input, tobi_busters_input)
+                # このフォームは回戦内の全卓をまとめて表示するため、まだ誰も入力していない
+                # (＝ゲストもまだ入力していない)卓の入力欄は初期値の0のままになっている。
+                # フィルタせずに保存すると、その卓の全員分が0点として保存されてしまい、
+                # (1)実際には未入力の卓に虚偽の0点記録が残る、
+                # (2)resultsのUNIQUE(round_id, member_id)制約により、後でゲストが
+                #    submit_guest_round_resultsで本来の素点を送信しようとしても
+                #    「すでに入力済み」として拒否されてしまう、という問題が起きる。
+                # そのため、既存レコードがある(＝既に入力済み)卓か、今回いずれかの選手の
+                # 値が0以外に変更された(＝この保存で実際に入力しようとしている)卓だけを
+                # 保存対象にする。
+                scores_to_save = {}
+                busters_to_save = {}
+                for table_number, table_seats in by_table.items():
+                    table_member_ids = [s["member_id"] for s in table_seats]
+                    already_entered = any(mid in existing_scores for mid in table_member_ids)
+                    touched = any(raw_scores_input[mid] != 0 for mid in table_member_ids)
+                    if not (already_entered or touched):
+                        continue
+                    for mid in table_member_ids:
+                        scores_to_save[mid] = raw_scores_input[mid]
+                        if mid in tobi_busters_input:
+                            busters_to_save[mid] = tobi_busters_input[mid]
+                db.save_round_results(selected_round_id, scores_to_save, busters_to_save)
                 st.success("成績を保存しました。")
                 st.rerun()
 

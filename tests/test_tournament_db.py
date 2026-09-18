@@ -312,6 +312,35 @@ def test_submit_guest_round_results_rejects_resubmission_of_same_table(tenant_an
     assert db.get_round_results(round_id) == first_scores
 
 
+def test_submit_guest_round_results_rolls_back_entire_batch_on_partial_conflict(tenant_and_members):
+    """4人分のうち1人だけ既に確定済み(重複エラーの原因)の場合、残り3人分も含めて
+    一切保存されない(部分コミットされない)ことを確認する。
+
+    member_ids[2]だけを先に確定させ、残り3人(member_ids[0], [1], [3])は
+    まだ未確定の状態で4人分まとめて送信する。辞書のイテレーション順は挿入順
+    (member_ids[0]→[1]→[2]→[3])のため、[0]・[1]は一度INSERTに成功したあとで
+    [2]の重複によりIntegrityErrorが起きる。このとき[0]・[1]の分もロールバックされ、
+    一切保存されていないことを確認する（トランザクション全体のアトミック性）。
+    """
+    tenant_id = tenant_and_members["tenant_id"]
+    member_ids = tenant_and_members["member_ids"]
+    tid = db.create_tournament(
+        tenant_id, "大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    round_id = db.save_round(tid, 1, [dict(zip(("東", "南", "西", "北"), member_ids))], [])
+
+    db.submit_guest_round_results(round_id, {member_ids[2]: 99999}, {})
+
+    new_scores = {
+        member_ids[0]: 40000, member_ids[1]: 30000, member_ids[2]: 20000, member_ids[3]: 10000,
+    }
+    with pytest.raises(db.ResultsAlreadySubmittedError):
+        db.submit_guest_round_results(round_id, new_scores, {})
+
+    # member_ids[0], [1], [3]はどれも保存されておらず、member_ids[2]も元の値のまま
+    assert db.get_round_results(round_id) == {member_ids[2]: 99999}
+
+
 # ---------------------------------------------------------------------------
 # ゲスト共有リンク
 # ---------------------------------------------------------------------------

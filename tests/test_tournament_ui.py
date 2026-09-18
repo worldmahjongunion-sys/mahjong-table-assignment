@@ -151,6 +151,58 @@ def test_admin_can_enter_round_results(app_env):
     assert sorted(saved_results.values(), reverse=True) == scores
 
 
+def test_admin_saving_one_table_does_not_zero_out_untouched_table(app_env):
+    """主催者の成績入力フォームは回戦内の全卓を1画面にまとめて表示するため、
+    ある卓だけ入力して保存すると、まだ誰も入力していない別の卓の選手が
+    初期値0のまま保存されてしまわないか（ゲストの未入力を潰してしまわないか）を確認する。"""
+    user_id = _add_user("admin1", "adminpass123", email="admin1@example.com")
+    tenant_id = db.get_user_by_id(user_id)["tenant_id"]
+    member_ids = [db.add_member(tenant_id, user_id, f"選手{i}", "") for i in range(8)]
+    tournament_id = db.create_tournament(
+        tenant_id, "テスト大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    for i, member_id in enumerate(member_ids, start=1):
+        db.add_tournament_member(tournament_id, member_id, i)
+    tournament = db.get_tournament(tenant_id, tournament_id)
+    round_number, absent, tables = svc.run_next_round(tournament)
+    svc.save_confirmed_round(tournament_id, round_number, absent, tables)
+    assert len(tables) == 2  # 8人なので2卓
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+
+    score_inputs = [ni for ni in at.number_input if ni.key and ni.key.startswith("score_")]
+    assert len(score_inputs) == 8
+
+    rounds = db.get_rounds(tournament_id)
+    seats = db.get_round_seats(rounds[0]["id"])
+    table1_member_ids = {s["member_id"] for s in seats if s["table_number"] == 1}
+    table2_member_ids = {s["member_id"] for s in seats if s["table_number"] == 2}
+
+    # 卓1だけ入力し、卓2は初期値0のまま何も触らない
+    table1_scores = [40000, 30000, 20000, 10000]
+    i = 0
+    for ni in score_inputs:
+        member_id = int(ni.key.rsplit("_", 1)[1])
+        if member_id in table1_member_ids:
+            ni.set_value(table1_scores[i])
+            i += 1
+    at.run()
+
+    at.button[_find_button(at, "成績を保存")].click().run()
+    assert not at.exception
+
+    saved_results = db.get_round_results(rounds[0]["id"])
+    assert set(saved_results.keys()) == table1_member_ids  # 卓2の選手は一切保存されない
+    assert sorted(saved_results.values(), reverse=True) == table1_scores
+
+    # 卓2はDB上「未入力」のままなので、ゲストが本来の素点を送信できる
+    table2_scores = {mid: 35000 for mid in table2_member_ids}
+    db.submit_guest_round_results(rounds[0]["id"], table2_scores, {})
+    assert db.get_round_results(rounds[0]["id"]) == {**saved_results, **table2_scores}
+
+
 def test_admin_can_issue_and_revoke_guest_link(app_env):
     user_id, tenant_id, member_ids, tournament_id = _setup_admin_with_tournament()
 
