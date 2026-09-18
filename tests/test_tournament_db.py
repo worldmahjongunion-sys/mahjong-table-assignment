@@ -234,6 +234,113 @@ def test_save_round_results_overwrites_previous_entry(tenant_and_members):
     assert db.get_round_results(round_id) == {member_ids[0]: 20000}
 
 
+def test_save_round_results_records_admin_as_input_source(tenant_and_members):
+    """ゲスト向け画面実装依頼_Stage2.md 3.5対応: 主催者による修正は入力経路'admin'・
+    入力日時を記録する。"""
+    tenant_id = tenant_and_members["tenant_id"]
+    member_ids = tenant_and_members["member_ids"]
+    tid = db.create_tournament(
+        tenant_id, "大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    round_id = db.save_round(tid, 1, [dict(zip(("東", "南", "西", "北"), member_ids))], [])
+
+    db.save_round_results(round_id, {member_ids[0]: 10000}, {})
+    meta = db.get_round_result_meta(round_id)
+
+    assert meta[member_ids[0]]["input_source"] == "admin"
+    assert meta[member_ids[0]]["created_at"]
+
+    # 修正すると入力日時が更新される
+    first_created_at = meta[member_ids[0]]["created_at"]
+    db.save_round_results(round_id, {member_ids[0]: 20000}, {})
+    meta_after_edit = db.get_round_result_meta(round_id)
+    assert meta_after_edit[member_ids[0]]["input_source"] == "admin"
+    assert meta_after_edit[member_ids[0]]["created_at"] >= first_created_at
+
+
+def test_submit_guest_round_results_records_guest_as_input_source(tenant_and_members):
+    tenant_id = tenant_and_members["tenant_id"]
+    member_ids = tenant_and_members["member_ids"]
+    tid = db.create_tournament(
+        tenant_id, "大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    round_id = db.save_round(tid, 1, [dict(zip(("東", "南", "西", "北"), member_ids))], [])
+
+    raw_scores = {mid: 25000 for mid in member_ids}
+    db.submit_guest_round_results(round_id, raw_scores, {})
+
+    assert db.get_round_results(round_id) == raw_scores
+    meta = db.get_round_result_meta(round_id)
+    assert all(m["input_source"] == "guest" for m in meta.values())
+    assert all(m["created_at"] for m in meta.values())
+
+
+def test_submit_guest_round_results_negative_score_round_trips(tenant_and_members):
+    tenant_id = tenant_and_members["tenant_id"]
+    member_ids = tenant_and_members["member_ids"]
+    tid = db.create_tournament(
+        tenant_id, "大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    round_id = db.save_round(tid, 1, [dict(zip(("東", "南", "西", "北"), member_ids))], [])
+
+    raw_scores = {member_ids[0]: 60000, member_ids[1]: 30000, member_ids[2]: 15000, member_ids[3]: -5000}
+    tobi_busters = {member_ids[3]: [member_ids[0]]}
+    db.submit_guest_round_results(round_id, raw_scores, tobi_busters)
+
+    assert db.get_round_results(round_id) == raw_scores
+    assert db.get_round_tobi_busters(round_id) == tobi_busters
+
+
+def test_submit_guest_round_results_rejects_resubmission_of_same_table(tenant_and_members):
+    """3.3「同じ卓に2人がほぼ同時に送信した場合、先に届いたものだけを確定」の
+    DB制約側の担保（UNIQUE制約によるIntegrityError→ResultsAlreadySubmittedError）。"""
+    tenant_id = tenant_and_members["tenant_id"]
+    member_ids = tenant_and_members["member_ids"]
+    tid = db.create_tournament(
+        tenant_id, "大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    round_id = db.save_round(tid, 1, [dict(zip(("東", "南", "西", "北"), member_ids))], [])
+
+    first_scores = {member_ids[0]: 40000, member_ids[1]: 30000, member_ids[2]: 20000, member_ids[3]: 10000}
+    db.submit_guest_round_results(round_id, first_scores, {})
+
+    second_scores = {member_ids[0]: 25000, member_ids[1]: 25000, member_ids[2]: 25000, member_ids[3]: 25000}
+    with pytest.raises(db.ResultsAlreadySubmittedError):
+        db.submit_guest_round_results(round_id, second_scores, {})
+
+    # 先に届いた内容がそのまま残り、後から届いた分は一切反映されない（部分的な上書きもされない）
+    assert db.get_round_results(round_id) == first_scores
+
+
+def test_submit_guest_round_results_rolls_back_entire_batch_on_partial_conflict(tenant_and_members):
+    """4人分のうち1人だけ既に確定済み(重複エラーの原因)の場合、残り3人分も含めて
+    一切保存されない(部分コミットされない)ことを確認する。
+
+    member_ids[2]だけを先に確定させ、残り3人(member_ids[0], [1], [3])は
+    まだ未確定の状態で4人分まとめて送信する。辞書のイテレーション順は挿入順
+    (member_ids[0]→[1]→[2]→[3])のため、[0]・[1]は一度INSERTに成功したあとで
+    [2]の重複によりIntegrityErrorが起きる。このとき[0]・[1]の分もロールバックされ、
+    一切保存されていないことを確認する（トランザクション全体のアトミック性）。
+    """
+    tenant_id = tenant_and_members["tenant_id"]
+    member_ids = tenant_and_members["member_ids"]
+    tid = db.create_tournament(
+        tenant_id, "大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    round_id = db.save_round(tid, 1, [dict(zip(("東", "南", "西", "北"), member_ids))], [])
+
+    db.submit_guest_round_results(round_id, {member_ids[2]: 99999}, {})
+
+    new_scores = {
+        member_ids[0]: 40000, member_ids[1]: 30000, member_ids[2]: 20000, member_ids[3]: 10000,
+    }
+    with pytest.raises(db.ResultsAlreadySubmittedError):
+        db.submit_guest_round_results(round_id, new_scores, {})
+
+    # member_ids[0], [1], [3]はどれも保存されておらず、member_ids[2]も元の値のまま
+    assert db.get_round_results(round_id) == {member_ids[2]: 99999}
+
+
 # ---------------------------------------------------------------------------
 # ゲスト共有リンク
 # ---------------------------------------------------------------------------
