@@ -70,14 +70,17 @@ def _split_amount(amount, n):
 def compute_total_score(raw_scores, uma_config, tobi_amount=0, tobi_busters=None):
     """①得点評価: 素点＋ウマ＋オカ（＋飛び賞）を合計した総合得点を計算する（仕様書.md 7章対応）。
 
-    raw_scores: その回戦の素点（選手番号→素点の辞書、4人分）。持ち点がマイナスの選手を
-        「飛んだ人」として自動判定する。
+    raw_scores: その回戦の素点（選手番号→素点の辞書、4人分）。素点が0以下（0またはマイナス）の
+        選手は「飛んだ人候補」としてUI側でチェックボックスの対象になる想定だが、本関数自体は
+        素点の符号を見ない。飛び賞が実際に発生するかどうかは素点の値ではなく、tobi_bustersに
+        「飛ばした人」が1人以上チェックされているかどうかだけで決まる。
     uma_config: {"start_point", "return_point", "oka", "uma_table": {1: [...], 2: [...], 3: [...]}}
         （すべて大会ごとに主催者が入力する値。コードにハードコードしない）
     tobi_amount: 飛び賞額（0なら飛び賞なし）
     tobi_busters: {飛んだ選手の選手番号: [飛ばした選手の選手番号, ...]}。
         飛んだ選手がこの辞書にキーとして存在しない、またはリストが空の場合は
-        その選手には飛び賞を適用しない（減算も加算も発生しない）。
+        その選手には飛び賞を適用しない（減算も加算も発生しない）。素点がちょうど0で
+        誰もチェックされていない場合も同様に適用しない。
 
     戻り値: {選手番号: ウマ・オカ・飛び賞適用後の総合得点}
     """
@@ -93,7 +96,7 @@ def compute_total_score(raw_scores, uma_config, tobi_amount=0, tobi_busters=None
     totals = {p: raw_scores[p] + uma_amounts[p] for p in raw_scores}
 
     for busted, busters in tobi_busters.items():
-        if busted not in raw_scores or raw_scores[busted] >= 0:
+        if busted not in raw_scores:
             continue
         busters = sorted(b for b in busters if b in raw_scores)
         if not busters:

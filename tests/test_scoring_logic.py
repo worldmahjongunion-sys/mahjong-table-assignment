@@ -146,6 +146,27 @@ def test_tobi_split_remainder_sums_exactly():
     assert added == 10000
 
 
+def test_tobi_zero_raw_score_boundary_is_treated_as_busted_when_checked():
+    """素点がちょうど0(境界値)でも、飛ばした人がチェックされていれば飛び賞が適用される。"""
+    raw_scores = {1: 50000, 2: 30000, 3: 20000, 4: 0}
+    totals = sl.compute_total_score(
+        raw_scores, UMA_CONFIG, tobi_amount=10000, tobi_busters={4: [1]}
+    )
+    uma_only = sl.compute_total_score(raw_scores, UMA_CONFIG)
+    assert totals[4] == uma_only[4] - 10000
+    assert totals[1] == uma_only[1] + 10000
+
+
+def test_tobi_zero_raw_score_boundary_without_busters_means_no_adjustment():
+    """素点がちょうど0で、誰もチェックされていない場合は飛び賞を適用しない。"""
+    raw_scores = {1: 50000, 2: 30000, 3: 20000, 4: 0}
+    totals = sl.compute_total_score(
+        raw_scores, UMA_CONFIG, tobi_amount=10000, tobi_busters={}
+    )
+    uma_only = sl.compute_total_score(raw_scores, UMA_CONFIG)
+    assert totals == uma_only
+
+
 def test_tobi_no_busters_checked_means_no_adjustment():
     """誰もチェックされなかった場合、その選手には飛び賞を適用しない（減算も加算もなし）。"""
     raw_scores = {1: 50000, 2: 30000, 3: 25000, 4: -5000}
