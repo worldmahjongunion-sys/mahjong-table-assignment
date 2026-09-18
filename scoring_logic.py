@@ -34,7 +34,15 @@ def _apply_placement_table(raw_scores, table):
     raw_scores: {選手番号: 素点}
     table: 1位から4位までの値のリスト（長さ4）
     戻り値: {選手番号: 割当値}
+
+    順位付けは1卓分（4人）の素点に対して行う。table_logic.pyの卓ごとに呼び出すこと。
+    複数卓ぶんをまとめて渡すとtableの長さを超えた順位に値が割り当てられず、
+    黙って0扱いになってしまうため、tableより多い人数はエラーにする。
     """
+    if len(raw_scores) > len(table):
+        raise ValueError(
+            f"順位付けは1卓ずつ行う必要があります（{len(raw_scores)}人分が渡されました。最大{len(table)}人）"
+        )
     ordered = sorted(raw_scores.keys(), key=lambda p: (-raw_scores[p], p))
     result = {}
     i = 0
@@ -118,6 +126,69 @@ def compute_rank_points(raw_scores, point_table):
     戻り値: {選手番号: その回戦の順位ポイント}
     """
     return _apply_placement_table(raw_scores, point_table)
+
+
+# ---- 点数の入出力単位（100点単位） ----
+# 画面では点数を「下2桁を省略した100点単位」で入出力する（45,800点は「458」）。
+# DB・計算ロジックは実際の点数のまま持ち、画面の入出力の境界でだけ100倍/100分の1に
+# 変換する。順位ポイントは点数ではないため対象外（そのままの数値で扱う）。
+POINT_UNIT = 100
+# 100点単位の入力として許容する絶対値の上限（2000＝200,000点）。これを超える入力は
+# 「45,800点なのに45800と入力した」ような桁の誤りとみなして保存させない。
+MAX_HUNDREDS_ABS = 2000
+HUNDREDS_INPUT_HINT = "点数は100点単位で入力します（例：45,800点なら458、-2,000点なら-20）"
+HUNDREDS_OUT_OF_RANGE_MESSAGE = "100点単位で入力してください(例:45,800点なら458)"
+
+
+def points_to_hundreds(points):
+    """実際の点数を、画面入力用の100点単位の値にする（45800→458）。
+
+    100で割り切れない点数（過去データなど）は小数のまま返し、丸めて情報を失わない。
+    """
+    if points % POINT_UNIT == 0:
+        return int(points // POINT_UNIT)
+    return points / POINT_UNIT
+
+
+def hundreds_to_points(hundreds):
+    """画面入力の100点単位の値を、実際の点数に戻す（458→45800）。"""
+    return int(round(hundreds * POINT_UNIT))
+
+
+def is_hundreds_input_plausible(points):
+    """100点単位で入力された点数（実点数に戻した値）の桁が妥当か（絶対値200,000点以内）。"""
+    return abs(points) <= MAX_HUNDREDS_ABS * POINT_UNIT
+
+
+def scoring_config_points_out_of_range(scoring_config):
+    """評価方式の設定値（実点数）に、桁が明らかにおかしいものが含まれるか。
+
+    対象は開始点数・返し点・オカ・飛び賞額・ウマ表。順位ポイント表は点数ではないので見ない。
+    """
+    values = [
+        scoring_config.get(key)
+        for key in ("start_point", "return_point", "oka", "tobi_amount")
+        if scoring_config.get(key) is not None
+    ]
+    for row in scoring_config.get("uma_table", {}).values():
+        values.extend(row)
+    return any(not is_hundreds_input_plausible(v) for v in values)
+
+
+def format_hundreds(points):
+    """実際の点数を、100点単位の表示用文字列にする（45800→"458"、-2000→"-20"）。"""
+    return format_point_value(points / POINT_UNIT)
+
+
+def format_point_value(value):
+    """順位ポイント・得点の表示用に、必要な桁だけの文字列にする（5.0→"5"、2.5→"2.5"）。
+
+    同着の折半で生じる小数は小数第4位まで見て、末尾の0は落とす。
+    """
+    rounded = round(value, 4)
+    if rounded == int(rounded):
+        return str(int(rounded))
+    return f"{rounded:.4f}".rstrip("0")
 
 
 def update_cumulative(cumulative, round_values):

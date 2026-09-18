@@ -221,3 +221,154 @@ def test_compute_standings_point_mode_tiebreaks_by_raw_score_then_player_number(
     standings = svc.compute_standings(tournament)
     top_two_ids = {standings[0]["member_id"], standings[1]["member_id"]}
     assert top_two_ids == {seats[0]["member_id"], seats[1]["member_id"]}
+
+
+# ---------------------------------------------------------------------------
+# 複数卓の回戦: 順位付け・ウマ・オカ・飛び賞は「卓ごと」に行う
+#
+# 既存の_play_and_save_roundは全卓に同じ素点を入れるため、回戦全員をまとめて順位付け
+# しても「卓ごとに同着」となり、卓をまたいだ誤りが表に出なかった。ここでは卓ごとに
+# 素点の水準を大きく変え（卓2は卓1より全員低い）、卓をまたいだ順位付けなら結果が
+# 必ず食い違うようにしている。
+# ---------------------------------------------------------------------------
+
+def _setup_two_table_round(scoring_mode, scoring_config, table_method="蛇行"):
+    """8人・2卓の第1回戦を保存し、(tournament, round_id, 卓1の4人, 卓2の4人)を返す。
+    卓ごとのmember_idは着席順（＝以降のテストで素点を割り当てる順）。"""
+    uid = db.add_user("owner", "hash")
+    tenant_id = db.get_user_by_username("owner")["tenant_id"]
+    member_ids = [db.add_member(tenant_id, uid, f"M{i}", "") for i in range(8)]
+    tid = db.create_tournament(
+        tenant_id, "2卓大会", "シーズン", table_method, scoring_mode, scoring_config, "受付順"
+    )
+    for member_id in member_ids:
+        db.add_tournament_member(tid, member_id, db.next_tournament_player_number(tid))
+    tournament = db.get_tournament(tenant_id, tid)
+    round_number, absent, tables = svc.run_next_round(tournament, random.Random(11))
+    round_id = svc.save_confirmed_round(tid, round_number, absent, tables)
+    seats = db.get_round_seats(round_id)
+    table1 = [s["member_id"] for s in seats if s["table_number"] == 1]
+    table2 = [s["member_id"] for s in seats if s["table_number"] == 2]
+    assert len(table1) == len(table2) == 4
+    return tournament, round_id, table1, table2
+
+
+def _save_scores(round_id, members, scores, tobi_busters=None):
+    """membersに素点scoresを割り当てて保存する（保存済みの成績は残す）。"""
+    saved = db.get_round_results(round_id)
+    saved_busters = db.get_round_tobi_busters(round_id)
+    saved.update(dict(zip(members, scores)))
+    saved_busters.update(tobi_busters or {})
+    db.save_round_results(round_id, saved, saved_busters)
+
+
+def test_point_mode_ranks_each_table_separately(temp_db):
+    """8人2卓: 卓1・卓2それぞれの中で1〜4位を決める。卓2の全員が卓1より低い素点でも、
+    卓2の1位は「回戦5位」ではなく卓内1位として3ポイントを得る。"""
+    tournament, round_id, table1, table2 = _setup_two_table_round("ポイント", POINT_CONFIG)
+    _save_scores(round_id, table1, (50000, 30000, 20000, 10000))
+    _save_scores(round_id, table2, (8000, 6000, 4000, 2000))
+
+    totals = svc.compute_round_totals(tournament, round_id)
+
+    assert [totals[m] for m in table1] == [3, 1, -1, -3]
+    assert [totals[m] for m in table2] == [3, 1, -1, -3]
+
+
+def test_point_mode_tie_in_one_table_does_not_affect_the_other(temp_db):
+    """同着の折半も卓内だけで行う。卓2の素点が卓1の同着と同じ値でも影響しない。"""
+    tournament, round_id, table1, table2 = _setup_two_table_round("ポイント", POINT_CONFIG)
+    _save_scores(round_id, table1, (40000, 40000, 20000, 10000))  # 卓1は1・2位同着
+    _save_scores(round_id, table2, (40000, 30000, 20000, 10000))  # 卓2の1位は卓1と同じ素点
+
+    totals = svc.compute_round_totals(tournament, round_id)
+
+    assert [totals[m] for m in table1] == [2, 2, -1, -3]  # (3+1)/2の折半
+    assert [totals[m] for m in table2] == [3, 1, -1, -3]  # 卓1の同着に巻き込まれない
+
+
+def test_score_mode_applies_uma_oka_and_tobi_per_table(temp_db):
+    """得点方式: 浮き人数（ウマ表の選択）・オカ・飛び賞も卓ごとに決まる。
+    卓1は2人浮き、卓2は0人浮き（オカがトップに乗る）＋飛び賞あり。"""
+    config = {**SCORE_CONFIG, "tobi_amount": 5000}  # 返し40000・オカ20000・ウマは2人浮きで[24000,8000,-8000,-24000]
+    tournament, round_id, table1, table2 = _setup_two_table_round("得点", config)
+    _save_scores(round_id, table1, (50000, 42000, 20000, 10000))
+    # 卓2は全員返し点未満（0人浮き）。4人目が飛び、1人目が飛ばした
+    _save_scores(round_id, table2, (36000, 34000, 32000, -2000), {table2[3]: [table2[0]]})
+
+    totals = svc.compute_round_totals(tournament, round_id)
+
+    assert [totals[m] for m in table1] == [
+        50000 + 24000, 42000 + 8000, 20000 - 8000, 10000 - 24000,
+    ]
+    assert [totals[m] for m in table2] == [
+        36000 + 20000 + 5000,  # 0人浮きのオカ＋飛ばした側の飛び賞
+        34000,
+        32000,
+        -2000 - 5000,          # 飛んだ側の飛び賞
+    ]
+
+
+def test_uncompleted_table_is_not_scored(temp_db):
+    """成績が未入力の卓は計算に含めない（入力済みの卓の結果は出る）。"""
+    tournament, round_id, table1, table2 = _setup_two_table_round("ポイント", POINT_CONFIG)
+    _save_scores(round_id, table1, (50000, 30000, 20000, 10000))
+
+    totals = svc.compute_round_totals(tournament, round_id)
+
+    assert set(totals) == set(table1)
+    assert [totals[m] for m in table1] == [3, 1, -1, -3]
+
+
+def test_cumulative_and_standings_are_per_table_across_rounds(temp_db):
+    """累計・大会内順位表も卓ごとの値の積み上げになる（2回戦分）。"""
+    tournament, round1, table1, table2 = _setup_two_table_round("ポイント", POINT_CONFIG)
+    tid = tournament["id"]
+    _save_scores(round1, table1, (50000, 30000, 20000, 10000))
+    _save_scores(round1, table2, (8000, 6000, 4000, 2000))
+
+    tournament = db.get_tournament(db.get_user_by_username("owner")["tenant_id"], tid)
+    number_of = {m["member_id"]: m["player_number"] for m in db.get_tournament_members(tid)}
+
+    expected_points = [3, 1, -1, -3]
+    cumulative = svc.build_cumulative_scores(tournament)
+    assert cumulative == {
+        number_of[m]: pts for table in (table1, table2) for m, pts in zip(table, expected_points)
+    }
+
+    standings = svc.compute_standings(tournament)
+    assert [row["value"] for row in standings] == [3, 3, 1, 1, -1, -1, -3, -3]
+    # 同ポイントは素点合計で決まる（各順位とも卓1の方が素点が高い）
+    assert [row["member_id"] for row in standings] == [
+        table1[0], table2[0], table1[1], table2[1], table1[2], table2[2], table1[3], table2[3],
+    ]
+
+
+def test_snake_next_round_uses_per_table_cumulative_points(temp_db):
+    """蛇行方式の次回戦の並び順: 卓ごとの順位ポイント（同ポイントは選手番号順）で1〜8位を
+    決め、蛇行で卓A={1,4,5,8位}・卓B={2,3,6,7位}に振り分ける。"""
+    tournament, round1, table1, table2 = _setup_two_table_round("ポイント", POINT_CONFIG)
+    tid = tournament["id"]
+    number_of = {m["member_id"]: m["player_number"] for m in db.get_tournament_members(tid)}
+    _save_scores(round1, table1, (50000, 30000, 20000, 10000))
+    _save_scores(round1, table2, (8000, 6000, 4000, 2000))
+
+    # 3点・1点・-1点・-3点の組が卓1・卓2に1人ずつ。同点内は選手番号の若い順
+    def by_number(a, b):
+        return sorted([a, b], key=number_of.get)
+
+    w_a, w_b = by_number(table1[0], table2[0])
+    s_a, s_b = by_number(table1[1], table2[1])
+    t_a, t_b = by_number(table1[2], table2[2])
+    l_a, l_b = by_number(table1[3], table2[3])
+    expected_tables = [
+        {number_of[m] for m in (w_a, s_b, t_a, l_b)},
+        {number_of[m] for m in (w_b, s_a, t_b, l_a)},
+    ]
+
+    tournament = db.get_tournament(db.get_user_by_username("owner")["tenant_id"], tid)
+    round_number, absent, tables = svc.run_next_round(tournament, random.Random(12))
+
+    assert round_number == 2
+    assert absent == []
+    assert [set(t.values()) for t in tables] == expected_tables

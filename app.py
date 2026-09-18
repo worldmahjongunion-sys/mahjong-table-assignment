@@ -31,6 +31,29 @@ def format_date_jp(iso_str: str | None) -> str:
     return f"{dt.year}年{dt.month}月{dt.day}日"
 
 
+def points_input(label: str, points: int, key: str, min_points: int | None = None) -> int:
+    """点数を100点単位で入力するnumber_input。実際の点数(int)を受け取り、実際の点数を返す。
+
+    画面の入力値は100点単位（45,800点なら458）で、DB・計算ロジックへ渡す値は実点数のまま
+    にするため、画面の入出力の境界（ここ）でだけ100倍/100分の1に変換する。
+    """
+    value = scoring_logic.points_to_hundreds(points)
+    is_int = isinstance(value, int)
+    kwargs = {}
+    if min_points is not None:
+        min_hundreds = scoring_logic.points_to_hundreds(min_points)
+        kwargs["min_value"] = min_hundreds if is_int else float(min_hundreds)
+    entered = st.number_input(label, value=value, step=1 if is_int else 1.0, key=key, **kwargs)
+    return scoring_logic.hundreds_to_points(entered)
+
+
+def format_result_value(scoring_mode: str, value) -> str:
+    """成績表の「値」列の表示。得点方式は100点単位、ポイント方式の順位ポイントはそのままの数値。"""
+    if scoring_mode == "得点":
+        return scoring_logic.format_hundreds(value)
+    return scoring_logic.format_point_value(value)
+
+
 def render_scoring_config_inputs(scoring_mode: str, key_prefix: str, defaults: dict | None = None) -> dict:
     """評価方式(得点/ポイント)のパラメータ入力欄を描画し、入力値の辞書を返す。
 
@@ -41,33 +64,30 @@ def render_scoring_config_inputs(scoring_mode: str, key_prefix: str, defaults: d
     （ゲスト向け画面実装依頼_Stage2.md 4章①対応。詳細は関数末尾のコメント参照）。
     """
     defaults = defaults or {}
+    st.caption(scoring_logic.HUNDREDS_INPUT_HINT + "。順位ポイントは点数ではないのでそのままの数値です。")
     if scoring_mode == "得点":
         default_uma_table = scoring_logic.DEFAULT_UMA_CONFIG["uma_table"]
         saved_uma_table = defaults.get("uma_table", {})
-        start_point = st.number_input(
+        start_point = points_input(
             "開始点数（持ち点）",
-            value=defaults.get("start_point", scoring_logic.DEFAULT_UMA_CONFIG["start_point"]),
-            step=1000,
-            key=f"{key_prefix}_start_point",
+            defaults.get("start_point", scoring_logic.DEFAULT_UMA_CONFIG["start_point"]),
+            f"{key_prefix}_start_point",
         )
-        return_point = st.number_input(
+        return_point = points_input(
             "返し点（オカの基準点）",
-            value=defaults.get("return_point", scoring_logic.DEFAULT_UMA_CONFIG["return_point"]),
-            step=1000,
-            key=f"{key_prefix}_return_point",
+            defaults.get("return_point", scoring_logic.DEFAULT_UMA_CONFIG["return_point"]),
+            f"{key_prefix}_return_point",
         )
-        oka = st.number_input(
+        oka = points_input(
             "オカ（0人浮き時にトップへ加算する額）",
-            value=defaults.get("oka", scoring_logic.DEFAULT_UMA_CONFIG["oka"]),
-            step=1000,
-            key=f"{key_prefix}_oka",
+            defaults.get("oka", scoring_logic.DEFAULT_UMA_CONFIG["oka"]),
+            f"{key_prefix}_oka",
         )
-        tobi_amount = st.number_input(
+        tobi_amount = points_input(
             "飛び賞額（0なら飛び賞なし）",
-            value=defaults.get("tobi_amount", 0),
-            step=1000,
-            min_value=0,
-            key=f"{key_prefix}_tobi_amount",
+            defaults.get("tobi_amount", 0),
+            f"{key_prefix}_tobi_amount",
+            min_points=0,
         )
 
         st.caption("ウマ表（浮き人数別・4着分の順位点）")
@@ -80,11 +100,10 @@ def render_scoring_config_inputs(scoring_mode: str, key_prefix: str, defaults: d
             for i, col in enumerate(cols):
                 with col:
                     row.append(
-                        st.number_input(
+                        points_input(
                             f"{i + 1}着",
-                            value=default_row[i],
-                            step=1000,
-                            key=f"{key_prefix}_uma_{floating_count}_{i}",
+                            default_row[i],
+                            f"{key_prefix}_uma_{floating_count}_{i}",
                         )
                     )
             uma_table_input[floating_count] = row
@@ -114,11 +133,10 @@ def render_scoring_config_inputs(scoring_mode: str, key_prefix: str, defaults: d
     # ゲスト向け画面実装依頼_Stage2.md 4章①対応: ポイント方式の大会にも開始点数だけを
     # 必須入力として持たせる（ウマ表・オカ・飛び賞額は追加しない）。ゲスト画面の成績入力で
     # 「4人分の素点合計＝開始点数×4」チェックに使うためで、点数計算そのものには使わない。
-    start_point = st.number_input(
+    start_point = points_input(
         "開始点数（持ち点。ゲスト成績入力の合計チェックに使用）",
-        value=defaults.get("start_point", scoring_logic.DEFAULT_UMA_CONFIG["start_point"]),
-        step=1000,
-        key=f"{key_prefix}_start_point",
+        defaults.get("start_point", scoring_logic.DEFAULT_UMA_CONFIG["start_point"]),
+        f"{key_prefix}_start_point",
     )
     return {"rank_point_table": rank_point_table_input, "start_point": start_point}
 
@@ -175,6 +193,7 @@ def render_guest_view(guest_token: str) -> None:
 
     st.divider()
     st.write("**成績の入力**")
+    st.caption(scoring_logic.HUNDREDS_INPUT_HINT)
 
     start_point = tournament["scoring_config"].get("start_point")
     if start_point is None:
@@ -191,16 +210,15 @@ def render_guest_view(guest_token: str) -> None:
         if already_submitted:
             st.info("この卓はすでに入力済みです。修正は主催者に依頼してください。")
             for mid in table_member_ids:
-                st.write(f"{member_id_to_name.get(mid, mid)}: {existing_scores[mid]:,}点")
+                st.write(f"{member_id_to_name.get(mid, mid)}: {scoring_logic.format_hundreds(existing_scores[mid])}")
         else:
             raw_scores_input = {}
             for seat in table_seats:
                 member_id = seat["member_id"]
-                raw_scores_input[member_id] = st.number_input(
+                raw_scores_input[member_id] = points_input(
                     f"{member_id_to_name.get(member_id, member_id)}（{seat['position']}）の素点",
-                    value=0,
-                    step=100,
-                    key=f"guest_score_{selected_round_id}_{member_id}",
+                    0,
+                    f"guest_score_{selected_round_id}_{member_id}",
                 )
 
             tobi_busters_input = {}
@@ -224,11 +242,17 @@ def render_guest_view(guest_token: str) -> None:
 
             total = sum(raw_scores_input.values())
             expected_total = start_point * 4
-            sum_ok = total == expected_total
-            if sum_ok:
-                st.success(f"合計 {total:,} 点です。")
+            digits_ok = all(scoring_logic.is_hundreds_input_plausible(v) for v in raw_scores_input.values())
+            sum_ok = digits_ok and total == expected_total
+            if not digits_ok:
+                st.error(scoring_logic.HUNDREDS_OUT_OF_RANGE_MESSAGE)
+            elif sum_ok:
+                st.success(f"合計 {scoring_logic.format_hundreds(total)} です。")
             else:
-                st.error(f"合計が {total:,} 点です。{expected_total:,} 点になるよう確認してください。")
+                st.error(
+                    f"合計が{scoring_logic.format_hundreds(total)}です。"
+                    f"{scoring_logic.format_hundreds(expected_total)}になるよう確認してください。"
+                )
 
             confirm = st.checkbox(
                 "送信すると修正できません。内容を確認しました。",
@@ -249,6 +273,8 @@ def render_guest_view(guest_token: str) -> None:
 
     st.divider()
     st.write("**大会内順位表**")
+    if tournament["scoring_mode"] == "得点":
+        st.caption("総合得点は100点単位で表示しています（458は45,800点）")
     standings = tournament_service.compute_standings(tournament)
     appearance_counts = tournament_service.build_appearance_counts(tournament["id"])
     if not standings:
@@ -259,7 +285,7 @@ def render_guest_view(guest_token: str) -> None:
                 {
                     "順位": i + 1,
                     "氏名": member_id_to_name.get(row["member_id"], row["member_id"]),
-                    "値": row["value"],
+                    "値": format_result_value(tournament["scoring_mode"], row["value"]),
                     "参加回戦数": appearance_counts.get(row["player_number"], 0),
                 }
                 for i, row in enumerate(standings)
@@ -783,34 +809,27 @@ else:
         default_uma_table = scoring_logic.DEFAULT_UMA_CONFIG["uma_table"]
         saved_uma_table = saved_scoring_config.get("uma_table", {})
         with st.form("scoring_config_score_form"):
-            start_point = st.number_input(
+            st.caption(scoring_logic.HUNDREDS_INPUT_HINT)
+            start_point = points_input(
                 "開始点数（持ち点）",
-                value=saved_scoring_config.get(
-                    "start_point", scoring_logic.DEFAULT_UMA_CONFIG["start_point"]
-                ),
-                step=1000,
-                key="scoring_start_point",
+                saved_scoring_config.get("start_point", scoring_logic.DEFAULT_UMA_CONFIG["start_point"]),
+                "scoring_start_point",
             )
-            return_point = st.number_input(
+            return_point = points_input(
                 "返し点（オカの基準点）",
-                value=saved_scoring_config.get(
-                    "return_point", scoring_logic.DEFAULT_UMA_CONFIG["return_point"]
-                ),
-                step=1000,
-                key="scoring_return_point",
+                saved_scoring_config.get("return_point", scoring_logic.DEFAULT_UMA_CONFIG["return_point"]),
+                "scoring_return_point",
             )
-            oka = st.number_input(
+            oka = points_input(
                 "オカ（0人浮き時にトップへ加算する額）",
-                value=saved_scoring_config.get("oka", scoring_logic.DEFAULT_UMA_CONFIG["oka"]),
-                step=1000,
-                key="scoring_oka",
+                saved_scoring_config.get("oka", scoring_logic.DEFAULT_UMA_CONFIG["oka"]),
+                "scoring_oka",
             )
-            tobi_amount = st.number_input(
+            tobi_amount = points_input(
                 "飛び賞額（0なら飛び賞なし）",
-                value=saved_scoring_config.get("tobi_amount", 0),
-                step=1000,
-                min_value=0,
-                key="scoring_tobi_amount",
+                saved_scoring_config.get("tobi_amount", 0),
+                "scoring_tobi_amount",
+                min_points=0,
             )
 
             st.caption("ウマ表（浮き人数別・4着分の順位点）")
@@ -823,25 +842,28 @@ else:
                 for i, col in enumerate(cols):
                     with col:
                         row.append(
-                            st.number_input(
+                            points_input(
                                 f"{i + 1}着",
-                                value=default_row[i],
-                                step=1000,
-                                key=f"uma_{floating_count}_{i}",
+                                default_row[i],
+                                f"uma_{floating_count}_{i}",
                             )
                         )
                 uma_table_input[floating_count] = row
 
             score_submitted = st.form_submit_button("設定を保存", key="scoring_score_submit")
             if score_submitted:
-                st.session_state["scoring_config"] = {
+                submitted_config = {
                     "start_point": start_point,
                     "return_point": return_point,
                     "oka": oka,
                     "tobi_amount": tobi_amount,
                     "uma_table": uma_table_input,
                 }
-                st.success("設定を保存しました。")
+                if scoring_logic.scoring_config_points_out_of_range(submitted_config):
+                    st.error(scoring_logic.HUNDREDS_OUT_OF_RANGE_MESSAGE)
+                else:
+                    st.session_state["scoring_config"] = submitted_config
+                    st.success("設定を保存しました。")
     else:
         default_rank_point_table = saved_scoring_config.get(
             "rank_point_table", scoring_logic.DEFAULT_RANK_POINT_TABLE
@@ -1130,6 +1152,8 @@ else:
             if create_submitted:
                 if not new_name.strip():
                     st.error("大会名を入力してください。")
+                elif scoring_logic.scoring_config_points_out_of_range(new_scoring_config):
+                    st.error(scoring_logic.HUNDREDS_OUT_OF_RANGE_MESSAGE)
                 else:
                     tournament_id = db.create_tournament(
                         tenant_id,
@@ -1212,6 +1236,8 @@ for tournament in tournaments:
                     if edit_submitted:
                         if not edit_name.strip():
                             st.error("大会名を入力してください。")
+                        elif scoring_logic.scoring_config_points_out_of_range(edit_scoring_config):
+                            st.error(scoring_logic.HUNDREDS_OUT_OF_RANGE_MESSAGE)
                         else:
                             db.update_tournament(
                                 tenant_id, tournament_id, edit_name.strip(), edit_kind,
@@ -1394,8 +1420,29 @@ for tournament in tournaments:
             for seat in seats:
                 by_table.setdefault(seat["table_number"], []).append(seat)
 
+            start_point = tournament["scoring_config"].get("start_point")
+            if start_point is None:
+                st.warning(
+                    "開始点数が未設定のため、成績を保存できません。大会設定で開始点数を設定してください。"
+                )
+            expected_total = start_point * 4 if start_point is not None else None
+            st.caption(scoring_logic.HUNDREDS_INPUT_HINT)
+
             raw_scores_input = {}
             tobi_busters_input = {}
+            # このフォームは回戦内の全卓をまとめて表示するため、まだ誰も入力していない
+            # (＝ゲストもまだ入力していない)卓の入力欄は初期値の0のままになっている。
+            # フィルタせずに保存すると、その卓の全員分が0点として保存されてしまい、
+            # (1)実際には未入力の卓に虚偽の0点記録が残る、
+            # (2)resultsのUNIQUE(round_id, member_id)制約により、後でゲストが
+            #    submit_guest_round_resultsで本来の素点を送信しようとしても
+            #    「すでに入力済み」として拒否されてしまう、という問題が起きる。
+            # そのため、既存レコードがある(＝既に入力済み)卓か、今回いずれかの選手の
+            # 値が0以外に変更された(＝この保存で実際に入力しようとしている)卓だけを
+            # 保存対象(save_tables)にし、合計チェックもその卓にだけかける。
+            save_tables: dict[int, list[int]] = {}
+            mismatched_tables: list[int] = []
+            implausible_tables: list[int] = []
             for table_number, table_seats in sorted(by_table.items()):
                 st.write(f"卓{table_number}")
                 score_cols = st.columns(4)
@@ -1403,11 +1450,10 @@ for tournament in tournaments:
                 for col, seat in zip(score_cols, table_seats):
                     with col:
                         member_id = seat["member_id"]
-                        score = st.number_input(
+                        score = points_input(
                             f"{member_id_to_name.get(member_id, member_id)}（{seat['position']}）",
-                            value=existing_scores.get(member_id, 0),
-                            step=100,
-                            key=f"score_{selected_round_id}_{member_id}",
+                            existing_scores.get(member_id, 0),
+                            f"score_{selected_round_id}_{member_id}",
                         )
                         raw_scores_input[member_id] = score
                 for seat in table_seats:
@@ -1425,39 +1471,65 @@ for tournament in tournaments:
                         if chosen_busters:
                             tobi_busters_input[member_id] = chosen_busters
 
+                already_entered = any(mid in existing_scores for mid in table_member_ids)
+                touched = any(raw_scores_input[mid] != 0 for mid in table_member_ids)
+                if already_entered or touched:
+                    save_tables[table_number] = table_member_ids
+                    if not all(
+                        scoring_logic.is_hundreds_input_plausible(raw_scores_input[mid]) for mid in table_member_ids
+                    ):
+                        # 桁がおかしい入力(45,800点を45800と入力した等)は、合計のずれではなく
+                        # 単位の誤りとして知らせる
+                        implausible_tables.append(table_number)
+                        st.error(f"卓{table_number}: {scoring_logic.HUNDREDS_OUT_OF_RANGE_MESSAGE}")
+                    elif expected_total is not None:
+                        table_total = sum(raw_scores_input[mid] for mid in table_member_ids)
+                        if table_total == expected_total:
+                            st.caption(f"卓{table_number}の合計 {scoring_logic.format_hundreds(table_total)}")
+                        else:
+                            mismatched_tables.append(table_number)
+                            st.error(
+                                f"卓{table_number}の合計が{scoring_logic.format_hundreds(table_total)}です。"
+                                f"{scoring_logic.format_hundreds(expected_total)}になるよう確認してください。"
+                            )
+
             if is_admin and st.button("成績を保存", key=f"save_results_{selected_round_id}"):
-                # このフォームは回戦内の全卓をまとめて表示するため、まだ誰も入力していない
-                # (＝ゲストもまだ入力していない)卓の入力欄は初期値の0のままになっている。
-                # フィルタせずに保存すると、その卓の全員分が0点として保存されてしまい、
-                # (1)実際には未入力の卓に虚偽の0点記録が残る、
-                # (2)resultsのUNIQUE(round_id, member_id)制約により、後でゲストが
-                #    submit_guest_round_resultsで本来の素点を送信しようとしても
-                #    「すでに入力済み」として拒否されてしまう、という問題が起きる。
-                # そのため、既存レコードがある(＝既に入力済み)卓か、今回いずれかの選手の
-                # 値が0以外に変更された(＝この保存で実際に入力しようとしている)卓だけを
-                # 保存対象にする。
-                scores_to_save = {}
-                busters_to_save = {}
-                for table_number, table_seats in by_table.items():
-                    table_member_ids = [s["member_id"] for s in table_seats]
-                    already_entered = any(mid in existing_scores for mid in table_member_ids)
-                    touched = any(raw_scores_input[mid] != 0 for mid in table_member_ids)
-                    if not (already_entered or touched):
-                        continue
-                    for mid in table_member_ids:
-                        scores_to_save[mid] = raw_scores_input[mid]
-                        if mid in tobi_busters_input:
-                            busters_to_save[mid] = tobi_busters_input[mid]
-                db.save_round_results(selected_round_id, scores_to_save, busters_to_save)
-                st.success("成績を保存しました。")
-                st.rerun()
+                # 依頼書3.5: 主催者の保存(修正を含む)にも、ゲスト入力と同じ「卓ごとの素点合計＝
+                # 開始点数×4」のチェックをかける。ずれている卓は上で赤字表示済みなので、ここでは
+                # 保存を止めるだけにする。
+                if expected_total is None:
+                    st.error("開始点数が未設定のため保存できません。")
+                elif implausible_tables:
+                    table_names = "、".join(f"卓{n}" for n in implausible_tables)
+                    st.error(f"点数の桁がおかしい卓があるため保存できません（{table_names}）。")
+                elif mismatched_tables:
+                    table_names = "、".join(f"卓{n}" for n in mismatched_tables)
+                    st.error(
+                        f"合計が{scoring_logic.format_hundreds(expected_total)}になっていない卓があるため"
+                        f"保存できません（{table_names}）。"
+                    )
+                else:
+                    scores_to_save = {}
+                    busters_to_save = {}
+                    for table_member_ids in save_tables.values():
+                        for mid in table_member_ids:
+                            scores_to_save[mid] = raw_scores_input[mid]
+                            if mid in tobi_busters_input:
+                                busters_to_save[mid] = tobi_busters_input[mid]
+                    db.save_round_results(selected_round_id, scores_to_save, busters_to_save)
+                    st.success("成績を保存しました。")
+                    st.rerun()
 
             if existing_scores:
                 totals = tournament_service.compute_round_totals(tournament, selected_round_id)
-                st.caption("この回戦の計算結果（" + ("総合得点" if tournament["scoring_mode"] == "得点" else "順位ポイント") + "）")
+                st.caption(
+                    "この回戦の計算結果（"
+                    + ("総合得点・100点単位" if tournament["scoring_mode"] == "得点" else "順位ポイント")
+                    + "）"
+                )
                 st.table(
                     [
-                        {"氏名": member_id_to_name.get(mid, mid), "値": value}
+                        {"氏名": member_id_to_name.get(mid, mid), "値": format_result_value(tournament["scoring_mode"], value)}
                         for mid, value in sorted(totals.items(), key=lambda kv: -kv[1])
                     ]
                 )
@@ -1465,6 +1537,8 @@ for tournament in tournaments:
         # ---- 大会内順位表 ----
         if rounds:
             st.write("**大会内順位表**")
+            if tournament["scoring_mode"] == "得点":
+                st.caption("総合得点は100点単位で表示しています（458は45,800点）")
             standings = tournament_service.compute_standings(tournament)
             member_id_to_name_all = {tm["member_id"]: tm["member_name"] for tm in tournament_members}
             st.table(
@@ -1473,7 +1547,7 @@ for tournament in tournaments:
                         "順位": i + 1,
                         "選手番号": row["player_number"],
                         "氏名": member_id_to_name_all.get(row["member_id"], row["member_id"]),
-                        "値": row["value"],
+                        "値": format_result_value(tournament["scoring_mode"], row["value"]),
                     }
                     for i, row in enumerate(standings)
                 ]
@@ -1484,8 +1558,7 @@ for tournament in tournaments:
         # ---- ゲスト共有リンク ----
         st.write("**ゲスト共有リンク**")
         st.caption(
-            "リンクを知っている人は、アカウント作成なしでこの大会の卓組み結果・成績を閲覧・入力できます"
-            "（ゲスト向け画面自体はStage 2で実装予定）。"
+            "リンクを知っている人は、アカウント作成なしでこの大会の卓組み結果・成績を閲覧・入力できます。"
         )
         active_link = db.get_active_guest_link(tournament_id)
         guest_token_key = f"guest_link_raw_{tournament_id}"

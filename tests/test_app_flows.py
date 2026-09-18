@@ -237,9 +237,10 @@ def test_choosing_score_mode_shows_uma_form_with_defaults_and_saves(app_env):
     assert not at.exception
     assert any("現在の評価方式" in md.value and "①得点で評価" in md.value for md in at.markdown)
 
-    # プレースホルダはscoring_logic.DEFAULT_UMA_CONFIGの参考値が入っている
-    assert at.number_input[_find_number_input(at, "開始点数")].value == 35000
-    assert at.number_input[_find_number_input(at, "返し点")].value == 40000
+    # プレースホルダはscoring_logic.DEFAULT_UMA_CONFIGの参考値が入っている。
+    # 画面は100点単位（35,000点は350）で表示し、保存する値は実際の点数のまま。
+    assert at.number_input[_find_number_input(at, "開始点数")].value == 350
+    assert at.number_input[_find_number_input(at, "返し点")].value == 400
 
     at.button[_find_button(at, "設定を保存")].click().run()
     assert not at.exception
@@ -247,6 +248,47 @@ def test_choosing_score_mode_shows_uma_form_with_defaults_and_saves(app_env):
     assert config["start_point"] == 35000
     assert config["return_point"] == 40000
     assert config["uma_table"][1] == [48000, -8000, -16000, -24000]
+
+
+def test_score_mode_config_is_entered_in_hundreds_and_saved_as_actual_points(app_env):
+    """開始点数・返し点・オカ・飛び賞額・ウマは100点単位で入力し、実際の点数で保持する。"""
+    _add_user("admin1", "adminpass123", email="admin1@example.com")
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+    at.button[_find_button(at, "①得点で評価")].click().run()
+
+    at.number_input[_find_number_input(at, "開始点数")].set_value(250)
+    at.number_input[_find_number_input(at, "返し点")].set_value(300)
+    at.number_input[_find_number_input(at, "0人浮き")].set_value(200)
+    at.number_input[_find_number_input(at, "飛び賞額")].set_value(10)
+    at.run()
+    at.button[_find_button(at, "設定を保存")].click().run()
+
+    assert not at.exception
+    config = at.session_state["scoring_config"]
+    assert (config["start_point"], config["return_point"], config["oka"], config["tobi_amount"]) == (
+        25000, 30000, 20000, 1000,
+    )
+    assert config["uma_table"][1] == [48000, -8000, -16000, -24000]  # 画面上は480,-80,-160,-240
+
+
+def test_score_mode_config_with_wrong_digits_shows_unit_hint_and_is_not_saved(app_env):
+    _add_user("admin1", "adminpass123", email="admin1@example.com")
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+    at.button[_find_button(at, "①得点で評価")].click().run()
+
+    at.number_input[_find_number_input(at, "開始点数")].set_value(25000)  # 25,000点のつもりで実点数を入力
+    at.run()
+    at.button[_find_button(at, "設定を保存")].click().run()
+
+    assert not at.exception
+    assert any("100点単位で入力してください(例:45,800点なら458)" in e.value for e in at.error)
+    assert "scoring_config" not in at.session_state or not at.session_state["scoring_config"]
 
 
 def test_choosing_points_mode_shows_rank_point_form_with_defaults_and_saves(app_env):
