@@ -276,3 +276,27 @@ def test_rank_points_rejects_more_than_one_table_of_players():
 def test_total_score_rejects_more_than_one_table_of_players():
     with pytest.raises(ValueError):
         sl.compute_total_score(EIGHT_PLAYER_SCORES, UMA_CONFIG)
+
+
+# ---------------------------------------------------------------------------
+# 表示用の整形
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (5, "5"),
+        (5.0, "5"),
+        (2.5, "2.5"),
+        (-3.0, "-3"),
+        (-1.5, "-1.5"),
+        (0, "0"),
+        (0.0, "0"),
+        (1 / 3, "0.3333"),
+        (2 / 3, "0.6667"),
+        (74000.0, "74000"),
+        (-0.00001, "0"),
+    ],
+)
+def test_format_point_value_shows_only_needed_digits(value, expected):
+    assert sl.format_point_value(value) == expected

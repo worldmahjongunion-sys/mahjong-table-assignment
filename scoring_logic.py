@@ -128,6 +128,17 @@ def compute_rank_points(raw_scores, point_table):
     return _apply_placement_table(raw_scores, point_table)
 
 
+def format_point_value(value):
+    """順位ポイント・得点の表示用に、必要な桁だけの文字列にする（5.0→"5"、2.5→"2.5"）。
+
+    同着の折半で生じる小数は小数第4位まで見て、末尾の0は落とす。
+    """
+    rounded = round(value, 4)
+    if rounded == int(rounded):
+        return str(int(rounded))
+    return f"{rounded:.4f}".rstrip("0")
+
+
 def update_cumulative(cumulative, round_values):
     """累計（累計得点／累計順位ポイント）に1回戦分を積み上げた新しいdictを返す。"""
     updated = dict(cumulative)

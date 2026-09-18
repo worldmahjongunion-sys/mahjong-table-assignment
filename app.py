@@ -259,7 +259,7 @@ def render_guest_view(guest_token: str) -> None:
                 {
                     "順位": i + 1,
                     "氏名": member_id_to_name.get(row["member_id"], row["member_id"]),
-                    "値": row["value"],
+                    "値": scoring_logic.format_point_value(row["value"]),
                     "参加回戦数": appearance_counts.get(row["player_number"], 0),
                 }
                 for i, row in enumerate(standings)
@@ -1485,7 +1485,7 @@ for tournament in tournaments:
                 st.caption("この回戦の計算結果（" + ("総合得点" if tournament["scoring_mode"] == "得点" else "順位ポイント") + "）")
                 st.table(
                     [
-                        {"氏名": member_id_to_name.get(mid, mid), "値": value}
+                        {"氏名": member_id_to_name.get(mid, mid), "値": scoring_logic.format_point_value(value)}
                         for mid, value in sorted(totals.items(), key=lambda kv: -kv[1])
                     ]
                 )
@@ -1501,7 +1501,7 @@ for tournament in tournaments:
                         "順位": i + 1,
                         "選手番号": row["player_number"],
                         "氏名": member_id_to_name_all.get(row["member_id"], row["member_id"]),
-                        "値": row["value"],
+                        "値": scoring_logic.format_point_value(row["value"]),
                     }
                     for i, row in enumerate(standings)
                 ]
@@ -1512,8 +1512,7 @@ for tournament in tournaments:
         # ---- ゲスト共有リンク ----
         st.write("**ゲスト共有リンク**")
         st.caption(
-            "リンクを知っている人は、アカウント作成なしでこの大会の卓組み結果・成績を閲覧・入力できます"
-            "（ゲスト向け画面自体はStage 2で実装予定）。"
+            "リンクを知っている人は、アカウント作成なしでこの大会の卓組み結果・成績を閲覧・入力できます。"
         )
         active_link = db.get_active_guest_link(tournament_id)
         guest_token_key = f"guest_link_raw_{tournament_id}"

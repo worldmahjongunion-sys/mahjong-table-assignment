@@ -581,3 +581,40 @@ def test_admin_save_blocked_when_start_point_is_missing(app_env):
 
     assert any("開始点数が未設定" in e.value for e in at.error)
     assert db.get_round_results(round_id) == {}
+
+
+def test_point_mode_values_are_shown_without_trailing_zeros_and_per_table(app_env):
+    """順位ポイントは「3.0000」ではなく「3」「2.5」の形で、卓ごとに1〜4位が決まって表示される。
+    卓1は1・2位同着(2.5ずつ)、卓2は同着なし。"""
+    tenant_id, tournament_id, round_id, table1, table2 = _setup_two_table_round(
+        scoring_mode="ポイント", scoring_config={"rank_point_table": [4, 1, -2, -3], "start_point": 35000}
+    )
+    db.save_round_results(round_id, {
+        **dict(zip(table1, (60000, 60000, 10000, 10000))),   # 1・2位同着(4+1)/2=2.5、3・4位同着(-2-3)/2=-2.5
+        **dict(zip(table2, (50000, 40000, 30000, 20000))),   # 4, 1, -2, -3
+    }, {})
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+
+    assert not at.exception
+    value_columns = [[str(v) for v in t.value["値"]] for t in at.table if "値" in t.value.columns]
+    assert value_columns, "値の列を持つ表が表示されていない"
+    flat = [v for column in value_columns for v in column]
+    assert not any(v.endswith(".0000") or v.endswith(".0") for v in flat)
+    # この回戦の計算結果表(値の降順): 卓2の1位4、卓1の同着2.5×2、卓2の2位1、...
+    assert sorted(value_columns[0], key=float, reverse=True) == ["4", "2.5", "2.5", "1", "-2", "-2.5", "-2.5", "-3"]
+
+
+def test_guest_link_description_no_longer_mentions_stage_2(app_env):
+    _setup_admin_with_tournament()
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+
+    captions = " ".join(c.value for c in at.caption)
+    assert "アカウント作成なしでこの大会の卓組み結果・成績を閲覧・入力できます" in captions
+    assert "Stage 2" not in captions
+    assert "実装予定" not in captions
