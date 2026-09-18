@@ -300,3 +300,55 @@ def test_total_score_rejects_more_than_one_table_of_players():
 )
 def test_format_point_value_shows_only_needed_digits(value, expected):
     assert sl.format_point_value(value) == expected
+
+
+# ---------------------------------------------------------------------------
+# 点数の入出力は100点単位（45,800点は「458」）。DB・計算は実際の点数のまま
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "points, hundreds",
+    [(45800, 458), (19200, 192), (-2000, -20), (0, 0), (35000, 350), (-100, -1)],
+)
+def test_points_and_hundreds_convert_both_ways(points, hundreds):
+    assert sl.points_to_hundreds(points) == hundreds
+    assert isinstance(sl.points_to_hundreds(points), int)
+    assert sl.hundreds_to_points(hundreds) == points
+
+
+def test_points_not_divisible_by_100_keep_their_fraction():
+    """100で割り切れない過去データを丸めて失わない。"""
+    assert sl.points_to_hundreds(12550) == 125.5
+    assert sl.hundreds_to_points(125.5) == 12550
+
+
+@pytest.mark.parametrize(
+    "points, expected",
+    [(45800, "458"), (19200, "192"), (-2000, "-20"), (0, "0"), (74050, "740.5"), (-14000.0, "-140")],
+)
+def test_format_hundreds_shows_points_in_hundreds_without_commas(points, expected):
+    assert sl.format_hundreds(points) == expected
+
+
+@pytest.mark.parametrize(
+    "hundreds, plausible",
+    [(2000, True), (-2000, True), (1200, True), (0, True), (2001, False), (-2001, False), (45800, False)],
+)
+def test_hundreds_input_plausibility_boundary_is_2000(hundreds, plausible):
+    """100点単位で絶対値2000（200,000点）まで。45,800点を「45800」と入力した誤りは弾く。"""
+    assert sl.is_hundreds_input_plausible(sl.hundreds_to_points(hundreds)) is plausible
+
+
+def test_scoring_config_out_of_range_checks_every_point_field_but_not_rank_points():
+    ok = {
+        "start_point": 35000, "return_point": 40000, "oka": 20000, "tobi_amount": 1000,
+        "uma_table": {1: [48000, -8000, -16000, -24000], 2: [24000, 8000, -8000, -24000]},
+    }
+    assert sl.scoring_config_points_out_of_range(ok) is False
+    for key in ("start_point", "return_point", "oka", "tobi_amount"):
+        assert sl.scoring_config_points_out_of_range({**ok, key: 3_500_000}) is True, key
+    bad_uma = {**ok, "uma_table": {1: [48000, -8000, -16000, -2_400_000]}}
+    assert sl.scoring_config_points_out_of_range(bad_uma) is True
+    # 順位ポイント（5・3・2・0など）は点数ではないので、桁の対象にしない
+    assert sl.scoring_config_points_out_of_range({"rank_point_table": [5000, 3, 2, 0], "start_point": 35000}) is False
+    assert sl.scoring_config_points_out_of_range({"rank_point_table": [3, 1, -1, -3]}) is False
