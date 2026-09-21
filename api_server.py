@@ -18,6 +18,8 @@
     API_TENANT_ID  このトークンで読める団体（tenant）のID（必須）。
                    トークンごとに見える範囲を1団体に限定し、他団体のデータを返さない。
     API_PORT       待ち受けポート（デフォルト 8082）
+    TRUST_PROXY_HOPS  信頼するリバースプロキシの段数（デフォルト 0）。0 なら
+                   X-Forwarded-For を見ない。1以上なら右からその段数目の値を呼び出し元IPとする。
 
 トークンの作り方:
     python -c "import secrets; print(secrets.token_urlsafe(32))"
@@ -72,12 +74,30 @@ def _too_many_requests():
     return resp
 
 
+def _trusted_proxy_hops() -> int:
+    # 不正な値や負数は 0（X-Forwarded-For を見ない）に倒す＝安全側。
+    try:
+        return max(int(os.environ.get("TRUST_PROXY_HOPS", "0")), 0)
+    except ValueError:
+        return 0
+
+
 def _client_ip() -> str:
-    # 本番(Railway)ではリバースプロキシ経由になり remote_addr がプロキシのIPに
-    # なるため、X-Forwarded-For の一番左を使う。付いていなければ remote_addr。
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    first = forwarded.split(",")[0].strip()
-    return first or request.remote_addr or "unknown"
+    """呼び出し元のIPを返す。
+
+    X-Forwarded-For は左に古い値（クライアントが詐称できる）、右に新しい値
+    （プロキシが追記した）が並ぶ。信頼できるプロキシが付けた値だけを信じるため、
+    TRUST_PROXY_HOPS（信頼するプロキシの段数 n）で右から n 番目を使う。
+    n=0（既定）ではヘッダを一切見ず remote_addr を使う。手元で直接起動したときは
+    プロキシが無いので、ヘッダが付いていれば必ずクライアントの詐称値になる。
+    """
+    hops = _trusted_proxy_hops()
+    if hops > 0:
+        parts = [p.strip() for p in request.headers.get("X-Forwarded-For", "").split(",")]
+        parts = [p for p in parts if p]
+        if len(parts) >= hops:
+            return parts[-hops]
+    return request.remote_addr or "unknown"
 
 
 def _audit_tenant_id() -> int | None:

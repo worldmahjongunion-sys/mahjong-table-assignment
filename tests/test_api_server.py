@@ -172,30 +172,86 @@ def test_requests_are_accepted_again_after_window(client, configured):
 
 
 def test_counters_are_independent_per_ip(client, configured):
-    _fail_n_times(client, MAX_FAILURES, headers={**_auth("wrong"), "X-Forwarded-For": "1.1.1.1"})
+    for _ in range(MAX_FAILURES):
+        client.get("/api/tournaments", headers=_auth("wrong"), environ_overrides={"REMOTE_ADDR": "1.1.1.1"})
 
-    blocked = client.get("/api/tournaments", headers={**_auth("wrong"), "X-Forwarded-For": "1.1.1.1"})
-    other = client.get("/api/tournaments", headers={**_auth(TOKEN), "X-Forwarded-For": "9.9.9.9"})
+    blocked = client.get("/api/tournaments", headers=_auth("wrong"), environ_overrides={"REMOTE_ADDR": "1.1.1.1"})
+    other = client.get("/api/tournaments", headers=_auth(TOKEN), environ_overrides={"REMOTE_ADDR": "9.9.9.9"})
 
     assert blocked.status_code == 429
     assert other.status_code == 200
 
 
-def test_uses_leftmost_x_forwarded_for_ip(client, configured):
-    _fail_n_times(
-        client, MAX_FAILURES,
-        headers={**_auth("wrong"), "X-Forwarded-For": "1.1.1.1, 10.0.0.1, 10.0.0.2"},
+def test_x_forwarded_for_is_ignored_by_default(client, configured):
+    # TRUST_PROXY_HOPS 未設定(=0)のとき、ヘッダを毎回変えて詐称しても制限を回避できない
+    for i in range(MAX_FAILURES):
+        resp = client.get("/api/tournaments", headers={**_auth("wrong"), "X-Forwarded-For": f"8.8.8.{i}"})
+        assert resp.status_code == 401
+
+    resp = client.get("/api/tournaments", headers={**_auth("wrong"), "X-Forwarded-For": "8.8.8.200"})
+
+    assert resp.status_code == 429
+
+
+def test_default_counts_by_remote_addr_even_if_header_present(client, configured):
+    for _ in range(MAX_FAILURES):
+        client.get("/api/tournaments", headers={**_auth("wrong"), "X-Forwarded-For": "8.8.8.8"})
+
+    # ヘッダの値(8.8.8.8)は無視され、remote_addrで数えられている
+    assert client.get("/api/tournaments", headers=_auth(TOKEN)).status_code == 429
+    assert client.get(
+        "/api/tournaments", headers=_auth(TOKEN), environ_overrides={"REMOTE_ADDR": "8.8.8.8"}
+    ).status_code == 200
+
+
+def test_trust_proxy_hops_1_uses_rightmost_value(client, configured, monkeypatch):
+    monkeypatch.setenv("TRUST_PROXY_HOPS", "1")
+    spoofed_then_real = {"X-Forwarded-For": "1.1.1.1, 2.2.2.2"}
+    for _ in range(MAX_FAILURES):
+        client.get("/api/tournaments", headers={**_auth("wrong"), **spoofed_then_real})
+
+    same_real_ip_other_spoof = client.get(
+        "/api/tournaments", headers={**_auth(TOKEN), "X-Forwarded-For": "7.7.7.7, 2.2.2.2"}
+    )
+    leftmost_only = client.get(
+        "/api/tournaments", headers={**_auth(TOKEN), "X-Forwarded-For": "1.1.1.1, 5.5.5.5"}
     )
 
-    same_client_other_proxy = client.get(
-        "/api/tournaments", headers={**_auth(TOKEN), "X-Forwarded-For": "1.1.1.1, 10.0.0.9"}
-    )
-    proxy_ip_only = client.get(
-        "/api/tournaments", headers={**_auth(TOKEN), "X-Forwarded-For": "10.0.0.1"}
-    )
+    # 数えられているのは右端の 2.2.2.2。左端(詐称可能な値)では数えない
+    assert same_real_ip_other_spoof.status_code == 429
+    assert leftmost_only.status_code == 200
 
-    assert same_client_other_proxy.status_code == 429
-    assert proxy_ip_only.status_code == 200
+
+def test_trust_proxy_hops_1_with_single_value_uses_it(client, configured, monkeypatch):
+    monkeypatch.setenv("TRUST_PROXY_HOPS", "1")
+    for _ in range(MAX_FAILURES):
+        client.get("/api/tournaments", headers={**_auth("wrong"), "X-Forwarded-For": "6.6.6.6"})
+
+    blocked = client.get("/api/tournaments", headers={**_auth(TOKEN), "X-Forwarded-For": "6.6.6.6"})
+    other = client.get("/api/tournaments", headers={**_auth(TOKEN), "X-Forwarded-For": "6.6.6.7"})
+
+    assert blocked.status_code == 429
+    assert other.status_code == 200
+
+
+def test_trust_proxy_hops_2_with_single_value_falls_back_to_remote_addr(client, configured, monkeypatch):
+    monkeypatch.setenv("TRUST_PROXY_HOPS", "2")
+    for i in range(MAX_FAILURES):
+        client.get("/api/tournaments", headers={**_auth("wrong"), "X-Forwarded-For": f"6.6.6.{i}"})
+
+    # 値が段数に満たないヘッダは信用せず remote_addr で数える(=毎回変えても回避できない)
+    assert client.get(
+        "/api/tournaments", headers={**_auth(TOKEN), "X-Forwarded-For": "6.6.6.99"}
+    ).status_code == 429
+
+
+@pytest.mark.parametrize("value", ["abc", "-1", ""])
+def test_invalid_trust_proxy_hops_is_treated_as_zero(client, configured, monkeypatch, value):
+    monkeypatch.setenv("TRUST_PROXY_HOPS", value)
+    for i in range(MAX_FAILURES):
+        client.get("/api/tournaments", headers={**_auth("wrong"), "X-Forwarded-For": f"8.8.8.{i}"})
+
+    assert client.get("/api/tournaments", headers=_auth(TOKEN)).status_code == 429
 
 
 def test_falls_back_to_remote_addr_without_x_forwarded_for(client, configured):
@@ -220,8 +276,10 @@ def test_503_when_token_unset_is_not_counted(client, configured, monkeypatch):
 
 
 def test_auth_failure_and_block_are_written_to_audit_log(client, configured):
-    _fail_n_times(client, MAX_FAILURES, headers={**_auth("wrong"), "X-Forwarded-For": "1.1.1.1"})
-    client.get("/api/tournaments", headers={**_auth("wrong"), "X-Forwarded-For": "1.1.1.1"})
+    env = {"REMOTE_ADDR": "1.1.1.1"}
+    for _ in range(MAX_FAILURES):
+        client.get("/api/tournaments", headers=_auth("wrong"), environ_overrides=env)
+    client.get("/api/tournaments", headers=_auth("wrong"), environ_overrides=env)
 
     logs = db.get_audit_logs(configured)
 
