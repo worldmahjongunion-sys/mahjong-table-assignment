@@ -7,8 +7,8 @@
 
 総当たり対策として、認証に失敗したリクエストを呼び出し元IPごとに数え、
 15分以内に10回失敗したIPは429で締め出す（既存のログインと同じ rate_limit_events を利用）。
-ブロック中は鍵の正否を判定せず、正しい鍵でも429を返す。失敗とブロックは audit_logs に
-記録するが、送られてきたトークン自体は記録しない。
+ブロック中は鍵の正否を判定せず、正しい鍵でも429を返す。失敗(401)は audit_logs に記録するが、
+ブロック(429)は攻撃で監査ログが膨らむのを避けるため記録しない。送られてきたトークン自体も記録しない。
 
 エンドポイント:
     GET /api/tournaments   大会の一覧（JSON）
@@ -125,11 +125,9 @@ def require_token():
         db.API_AUTH_FAILURE_RATE_LIMIT_MAX_ATTEMPTS,
         db.API_AUTH_FAILURE_RATE_LIMIT_WINDOW_MINUTES,
     ):
-        db.record_audit_log(
-            action="api_rate_limited",
-            tenant_id=_audit_tenant_id(),
-            detail=f"ip={ip}, path={request.path}",
-        )
+        # 429は監査ログに書かない。叩かれるほどテーブルが膨らむと攻撃の手助けに
+        # なるため（既存のログインもブロック中の試行は記録していない）。
+        # ブロックが起きたことは、直前の api_auth_failed が10件残っていることから復元できる。
         return _too_many_requests()
 
     header = request.headers.get("Authorization", "")

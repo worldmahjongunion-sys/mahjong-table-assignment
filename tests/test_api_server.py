@@ -275,18 +275,26 @@ def test_503_when_token_unset_is_not_counted(client, configured, monkeypatch):
     assert client.get("/api/tournaments", headers=_auth(TOKEN)).status_code == 200
 
 
-def test_auth_failure_and_block_are_written_to_audit_log(client, configured):
-    env = {"REMOTE_ADDR": "1.1.1.1"}
+def test_auth_failure_is_written_to_audit_log(client, configured):
     for _ in range(MAX_FAILURES):
-        client.get("/api/tournaments", headers=_auth("wrong"), environ_overrides=env)
-    client.get("/api/tournaments", headers=_auth("wrong"), environ_overrides=env)
+        client.get("/api/tournaments", headers=_auth("wrong"), environ_overrides={"REMOTE_ADDR": "1.1.1.1"})
 
     logs = db.get_audit_logs(configured)
 
-    actions = [log["action"] for log in logs]
-    assert actions.count("api_auth_failed") == MAX_FAILURES
-    assert actions.count("api_rate_limited") == 1
+    assert [log["action"] for log in logs] == ["api_auth_failed"] * MAX_FAILURES
     assert all("ip=1.1.1.1" in log["detail"] for log in logs)
+
+
+def test_blocked_requests_do_not_write_audit_log(client, configured):
+    _fail_n_times(client, MAX_FAILURES)
+    rows_before = len(db.get_audit_logs(configured))
+
+    for token in ("wrong", TOKEN, "wrong"):
+        assert client.get("/api/tournaments", headers=_auth(token)).status_code == 429
+
+    logs = db.get_audit_logs(configured)
+    assert len(logs) == rows_before
+    assert "api_rate_limited" not in [log["action"] for log in logs]
 
 
 def test_presented_token_is_never_logged(client, configured, caplog):
