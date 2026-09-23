@@ -36,7 +36,7 @@ def _find_button(at, label_substr):
 def _login(at, username, password):
     at.text_input[0].set_value(username)
     at.text_input[1].set_value(password)
-    at.button[_find_button(at, "Login")].click().run()
+    at.button[_find_button(at, "ログイン")].click().run()
 
 
 def _add_user(username, password, **kwargs):

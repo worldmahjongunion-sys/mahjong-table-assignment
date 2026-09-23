@@ -14,6 +14,16 @@ POSITIONS = ("東", "南", "西", "北")
 _POSITIONS_SET = set(POSITIONS)
 
 
+def position_sort_key(position):
+    """席の表示順（東→南→西→北）を返すソートキー。
+
+    卓組み結果（tables内の各dict）はキーの挿入順が席割り当ての乱数処理の都合で
+    バラバラになることがある（例: _random_tables()）。DBの保存順や卓組み自体の
+    乱数処理には手を入れず、画面表示の並べ替えにだけこれを使う。
+    """
+    return POSITIONS.index(position)
+
+
 def compute_table_count_and_absent(n):
     """N人から卓数T・抜け番人数Rを計算する（4.1）。"""
     return n // 4, n % 4
