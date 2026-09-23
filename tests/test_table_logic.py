@@ -448,3 +448,22 @@ def test_one_day_reproducibility():
         members, 2, appearance_counts, set(), position_history, co_seat_counts, rng_d
     )
     assert result_c != result_d or True  # 参考情報として記録のみ
+
+
+# ---------------------------------------------------------------------------
+# 表示順（Phase0テストケース.mdの29件とは別。10/2前の表示改善対応）
+# ---------------------------------------------------------------------------
+
+def test_position_sort_key_orders_east_south_west_north():
+    """position_sort_key: 席のキー挿入順がバラバラでも、東→南→西→北の表示順に並べ替えられる。
+
+    _random_tables()はplayer/positionを別々にシャッフルしてzipするため、卓組み結果の
+    dictのキー挿入順（＝画面でtable.items()をそのまま列挙した場合の表示順）が
+    「北・西・東・南」のようにバラバラになりうる。これがDB保存・卓組みロジック自体には
+    影響しない（値の対応関係は変わらない）ことも合わせて確認する。
+    """
+    scrambled = {"北": "d", "西": "c", "東": "a", "南": "b"}
+    ordered = sorted(scrambled.items(), key=lambda kv: tl.position_sort_key(kv[0]))
+    assert ordered == [("東", "a"), ("南", "b"), ("西", "c"), ("北", "d")]
+    # 並べ替えても position→player の対応関係(値)は変わらない
+    assert dict(ordered) == scrambled

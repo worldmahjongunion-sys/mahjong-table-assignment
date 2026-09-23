@@ -13,8 +13,36 @@ import db
 import exports
 import scoring_logic
 import tournament_service
+from table_logic import position_sort_key
 
 st.set_page_config(page_title="麻雀卓組みアプリ", page_icon="🀄")
+
+# Streamlitが出力するHTMLシェル(pipパッケージ同梱・このリポジトリでは編集不可。
+# Railwayもデプロイのたびにpip installし直すため、そちら側を直接書き換えても残らない)は
+# <html lang="en">固定になっている。画面の文言は全て日本語のため、宣言言語と実際の内容が
+# 食い違い、モバイルブラウザの自動翻訳が誤作動しやすい(issue #34の予防策)。
+# st.markdown(unsafe_allow_html=True)での<script>挿入はStreamlitのレンダリング方式
+# (dangerouslySetInnerHTML)により実行されないため、st.iframeのiframe(srcdoc)経由で
+# window.parent.document(＝実際のページ)を書き換える。失敗しても画面には影響しない
+# (try/catchで握りつぶす)、翻訳を完全に禁止する保証はない、あくまで予防策。
+st.iframe(
+    """
+    <script>
+    try {
+      var d = window.parent.document;
+      d.documentElement.lang = "ja";
+      d.documentElement.setAttribute("translate", "no");
+      if (!d.querySelector('meta[name="google"]')) {
+        var m = d.createElement("meta");
+        m.name = "google";
+        m.content = "notranslate";
+        d.head.appendChild(m);
+      }
+    } catch (e) {}
+    </script>
+    """,
+    height=1,
+)
 
 db.init_db()
 
@@ -52,6 +80,12 @@ def format_result_value(scoring_mode: str, value) -> str:
     if scoring_mode == "得点":
         return scoring_logic.format_hundreds(value)
     return scoring_logic.format_point_value(value)
+
+
+def standings_value_column_label(scoring_mode: str) -> str:
+    """大会内順位表の値の列見出し。「点」(実際の点数)と「ポイント」(評価値)の用語を統一するため、
+    汎用的な「値」ではなく評価方式に応じた具体的な名称にする。"""
+    return "総合得点" if scoring_mode == "得点" else "合計ポイント"
 
 
 def render_scoring_config_inputs(scoring_mode: str, key_prefix: str, defaults: dict | None = None) -> dict:
@@ -178,6 +212,8 @@ def render_guest_view(guest_token: str) -> None:
     by_table: dict[int, list] = {}
     for seat in seats:
         by_table.setdefault(seat["table_number"], []).append(seat)
+    for table_seats in by_table.values():
+        table_seats.sort(key=lambda s: position_sort_key(s["position"]))
 
     st.write("**卓組み結果**")
     for table_number, table_seats in sorted(by_table.items()):
@@ -236,6 +272,7 @@ def render_guest_view(guest_token: str) -> None:
                             default=default_busters,
                             format_func=lambda m: member_id_to_name.get(m, m),
                             key=f"guest_busters_{selected_round_id}_{member_id}",
+                            placeholder="選択してください",
                         )
                         if chosen_busters:
                             tobi_busters_input[member_id] = chosen_busters
@@ -285,7 +322,9 @@ def render_guest_view(guest_token: str) -> None:
                 {
                     "順位": i + 1,
                     "氏名": member_id_to_name.get(row["member_id"], row["member_id"]),
-                    "値": format_result_value(tournament["scoring_mode"], row["value"]),
+                    standings_value_column_label(tournament["scoring_mode"]): format_result_value(
+                        tournament["scoring_mode"], row["value"]
+                    ),
                     "参加回戦数": appearance_counts.get(row["player_number"], 0),
                 }
                 for i, row in enumerate(standings)
@@ -491,9 +530,9 @@ if not st.session_state.get("authentication_status"):
 
 if not st.session_state.get("authentication_status"):
     with st.form("login_form"):
-        login_username_input = st.text_input("Username", autocomplete="off")
-        login_password_input = st.text_input("Password", type="password", autocomplete="off")
-        login_submitted = st.form_submit_button("Login")
+        login_username_input = st.text_input("ユーザー名", autocomplete="off")
+        login_password_input = st.text_input("パスワード", type="password", autocomplete="off")
+        login_submitted = st.form_submit_button("ログイン")
 
     if login_submitted:
         login_username_norm = login_username_input.strip().lower()
@@ -1372,7 +1411,7 @@ for tournament in tournaments:
             for table_number, table in enumerate(preview["tables"], start=1):
                 seat_line = "　".join(
                     f"{position}: {player_number_to_name.get(player_number, player_number)}"
-                    for position, player_number in table.items()
+                    for position, player_number in sorted(table.items(), key=lambda kv: position_sort_key(kv[0]))
                 )
                 st.write(f"卓{table_number}: {seat_line}")
             if preview["absent"]:
@@ -1419,6 +1458,8 @@ for tournament in tournaments:
             by_table: dict[int, list] = {}
             for seat in seats:
                 by_table.setdefault(seat["table_number"], []).append(seat)
+            for table_seats in by_table.values():
+                table_seats.sort(key=lambda s: position_sort_key(s["position"]))
 
             start_point = tournament["scoring_config"].get("start_point")
             if start_point is None:
@@ -1467,6 +1508,7 @@ for tournament in tournaments:
                             default=default_busters,
                             format_func=lambda m: member_id_to_name.get(m, m),
                             key=f"busters_{selected_round_id}_{member_id}",
+                            placeholder="選択してください",
                         )
                         if chosen_busters:
                             tobi_busters_input[member_id] = chosen_busters
@@ -1547,7 +1589,9 @@ for tournament in tournaments:
                         "順位": i + 1,
                         "選手番号": row["player_number"],
                         "氏名": member_id_to_name_all.get(row["member_id"], row["member_id"]),
-                        "値": format_result_value(tournament["scoring_mode"], row["value"]),
+                        standings_value_column_label(tournament["scoring_mode"]): format_result_value(
+                            tournament["scoring_mode"], row["value"]
+                        ),
                     }
                     for i, row in enumerate(standings)
                 ]

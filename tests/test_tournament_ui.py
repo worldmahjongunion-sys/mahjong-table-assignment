@@ -58,7 +58,7 @@ def _find_button(at, label_substr):
 def _login(at, username, password):
     at.text_input[0].set_value(username)
     at.text_input[1].set_value(password)
-    at.button[_find_button(at, "Login")].click().run()
+    at.button[_find_button(at, "ログイン")].click().run()
 
 
 def _setup_admin_with_tournament(tenant_and_members=True):
@@ -149,6 +149,44 @@ def test_admin_can_enter_round_results(app_env):
     rounds = db.get_rounds(tournament_id)
     saved_results = db.get_round_results(rounds[0]["id"])
     assert sorted(saved_results.values(), reverse=True) == scores
+
+
+def test_saved_round_with_scrambled_seat_order_displays_east_south_west_north(app_env):
+    """卓組み結果のdictキー挿入順が「北→西→東→南」のようにバラバラでも
+    (_random_tables()が実際に起こしうる並び)、主催者の成績入力欄・ゲスト画面の
+    卓組み結果とも東→南→西→北の順で表示される。DBの生の保存順（挿入順）自体は
+    変えていない前提（表示側だけの並べ替え）であることも合わせて確認する。"""
+    user_id, tenant_id, member_ids, tournament_id = _setup_admin_with_tournament()
+    for i, member_id in enumerate(member_ids, start=1):
+        db.add_tournament_member(tournament_id, member_id, i)
+    taro, jiro, saburo, shiro = member_ids
+    # 東=太郎, 南=次郎, 西=三郎, 北=四郎 という対応だが、わざと挿入順をバラバラにする
+    scrambled_table = {"北": shiro, "西": saburo, "東": taro, "南": jiro}
+    round_id = db.save_round(tournament_id, 1, [scrambled_table], [])
+
+    # 生のDB順（=挿入順）は依然バラバラなまま（卓組みロジック・保存内容は変更していない）
+    raw_seats = db.get_round_seats(round_id)
+    assert [s["position"] for s in raw_seats] == ["北", "西", "東", "南"]
+
+    raw_token = db.create_guest_link(tournament_id, user_id)
+    expected_names = ["太郎", "次郎", "三郎", "四郎"]  # 東→南→西→北の順
+
+    # 主催者の成績入力欄
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+    score_labels = [ni.label for ni in at.number_input if ni.key and ni.key.startswith("score_")]
+    assert [label.split("（")[0] for label in score_labels] == expected_names
+
+    # ゲスト画面の卓組み結果
+    at_guest = AppTest.from_file(APP_PATH)
+    at_guest.query_params["guest"] = raw_token
+    at_guest.run()
+    seat_lines = [
+        md.value.strip() for md in at_guest.markdown
+        if md.value.strip().startswith(("東:", "南:", "西:", "北:"))
+    ]
+    assert [line.split(": ", 1)[1] for line in seat_lines] == expected_names
 
 
 def test_admin_saving_one_table_does_not_zero_out_untouched_table(app_env):
@@ -310,7 +348,7 @@ def test_guest_view_opens_with_valid_token(app_env):
 
     assert not at.exception
     assert any("テスト大会" in md.value for md in list(at.markdown) + list(at.subheader))
-    assert not any("Login" in b.label for b in at.button)
+    assert not any("ログイン" in b.label for b in at.button)
 
 
 def test_guest_view_shows_message_for_invalid_token(app_env):
@@ -322,7 +360,7 @@ def test_guest_view_shows_message_for_invalid_token(app_env):
 
     assert not at.exception
     assert any("このリンクは使えません" in e.value for e in at.error)
-    assert not any("Login" in b.label for b in at.button)
+    assert not any("ログイン" in b.label for b in at.button)
     assert len(at.text_input) == 0  # ログインフォームが描画されていない
 
 
@@ -722,8 +760,9 @@ def test_admin_shows_score_mode_totals_in_hundreds(app_env):
 
     assert not at.exception
     columns = [[str(v) for v in t.value["値"]] for t in at.table if "値" in t.value.columns]
+    standings_columns = [[str(v) for v in t.value["総合得点"]] for t in at.table if "総合得点" in t.value.columns]
     assert columns[0] == ["940", "580", "170", "-290"]  # この回戦の計算結果(値の降順)
-    assert columns[1] == ["940", "580", "170", "-290"]  # 大会内順位表
+    assert standings_columns[0] == ["940", "580", "170", "-290"]  # 大会内順位表
 
 
 def test_admin_score_input_in_hundreds_saves_actual_points(app_env):
