@@ -448,6 +448,35 @@ def test_guest_score_submit_enabled_and_saves_when_sum_exact(app_env):
     assert all(m["input_source"] == "guest" for m in meta.values())
 
 
+def test_guest_submit_rechecks_sum_when_a_score_is_edited_and_submitted_at_once(app_env):
+    """合計ぴったりで送信ボタンが押せる状態から、素点を1つ書き換えてそのまま送信ボタンを押す。
+
+    ブラウザでは、入力欄の書き換えと送信ボタンの押下が同じ再実行で届く（ボタンは直前の
+    画面では押せる状態だった）。送信ボタンを押せなくするだけでは止まらないので、
+    送信時にも合計を確かめ直す。10/2前に実際のブラウザで、合計139900のまま保存される
+    ことを確認して直した。ゲストの送信は修正できないため、ここで止めることが重要。
+    """
+    user_id, tenant_id, member_ids, tournament_id, raw_token = _setup_tournament_with_round()
+
+    at = AppTest.from_file(APP_PATH)
+    at.query_params["guest"] = raw_token
+    at.run()
+    score_inputs = [ni for ni in at.number_input if ni.key and ni.key.startswith("guest_score_")]
+    for ni, v in zip(score_inputs, [700, 500, 250, -50]):  # 合計1400(ぴったり)
+        ni.set_value(v)
+    at.checkbox[0].check()
+    at.run()
+    assert not at.button[_find_button(at, "この内容で送信する")].disabled
+
+    score_inputs = [ni for ni in at.number_input if ni.key and ni.key.startswith("guest_score_")]
+    score_inputs[3].set_value(-51)  # 合計1399に書き換え、同じ再実行で送信
+    at.button[_find_button(at, "この内容で送信する")].click().run()
+
+    assert not at.exception
+    assert db.get_round_results(db.get_rounds(tournament_id)[0]["id"]) == {}  # 保存されない
+    assert any("送信できませんでした" in e.value for e in at.error)
+
+
 def test_guest_view_already_submitted_table_is_read_only(app_env):
     user_id, tenant_id, member_ids, tournament_id, raw_token = _setup_tournament_with_round()
     rounds = db.get_rounds(tournament_id)
