@@ -382,3 +382,82 @@ def test_get_active_guest_link_returns_none_when_not_issued(tenant_and_members):
         tenant_id, "大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
     )
     assert db.get_active_guest_link(tid) is None
+
+
+# ---------------------------------------------------------------------------
+# 主催者の保存とゲストの送信が重なったとき（10/2前の修正）
+#
+# 主催者の保存は「保存する卓だけ」を入れ直す。回戦全体を消して入れ直すと、主催者の画面に
+# 出ていない卓(＝画面を作った後にゲストが送信した卓)の成績が消えてしまうため。
+# また、保存する卓の成績が「主催者の画面を作ったとき」から変わっていたら、他の人が
+# 入力したものとして保存しない(ResultsChangedError)。
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def two_table_round(tenant_and_members):
+    tenant_id = tenant_and_members["tenant_id"]
+    user_id = tenant_and_members["user_id"]
+    more = [db.add_member(tenant_id, user_id, name, "") for name in ("Eve", "Frank", "Grace", "Heidi")]
+    table1, table2 = tenant_and_members["member_ids"], more
+    tid = db.create_tournament(tenant_id, "大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順")
+    winds = ("東", "南", "西", "北")
+    round_id = db.save_round(tid, 1, [dict(zip(winds, table1)), dict(zip(winds, table2))], [])
+    return round_id, table1, table2
+
+
+GUEST_T1 = (45000, 35000, 32000, 28000)
+ADMIN_T2 = (60000, 40000, 30000, 10000)
+
+
+def test_admin_save_replaces_only_the_tables_being_saved(two_table_round):
+    round_id, table1, table2 = two_table_round
+    db.submit_guest_round_results(round_id, dict(zip(table1, GUEST_T1)), {table1[3]: [table1[0]]})
+
+    db.save_round_results(round_id, dict(zip(table2, ADMIN_T2)), {})
+
+    saved = db.get_round_results(round_id)
+    assert [saved[m] for m in table1] == list(GUEST_T1)  # ゲストの卓1は消えない
+    assert [saved[m] for m in table2] == list(ADMIN_T2)
+    assert db.get_round_tobi_busters(round_id) == {table1[3]: [table1[0]]}
+    meta = db.get_round_result_meta(round_id)
+    assert all(meta[m]["input_source"] == "guest" for m in table1)  # 入力者の記録も残る
+
+
+def test_admin_save_stops_when_the_table_changed_since_the_screen_was_built(two_table_round):
+    round_id, table1, _ = two_table_round
+    seen_when_screen_was_built = {m: None for m in table1}  # 主催者の画面では卓1は未入力だった
+    db.submit_guest_round_results(round_id, dict(zip(table1, GUEST_T1)), {})  # その後ゲストが送信
+
+    with pytest.raises(db.ResultsChangedError):
+        db.save_round_results(
+            round_id, dict(zip(table1, ADMIN_T2)), {},
+            expected_scores=seen_when_screen_was_built, expected_busters={},
+        )
+
+    assert [db.get_round_results(round_id)[m] for m in table1] == list(GUEST_T1)  # 何も書き換わらない
+
+
+def test_admin_save_stops_when_only_tobi_busters_changed(two_table_round):
+    round_id, table1, _ = two_table_round
+    scores = dict(zip(table1, (50000, 45000, 45000, 0)))
+    db.save_round_results(round_id, scores, {})
+    with db.get_connection() as conn:  # 別の主催者が飛び賞だけ直した
+        conn.execute(
+            "INSERT INTO tobi_busters (round_id, busted_member_id, buster_member_id, created_at, input_source) "
+            "VALUES (?, ?, ?, '2026-10-02T10:00:00', 'admin')",
+            (round_id, table1[3], table1[0]),
+        )
+
+    with pytest.raises(db.ResultsChangedError):
+        db.save_round_results(round_id, scores, {}, expected_scores=scores, expected_busters={})
+
+
+def test_admin_save_succeeds_when_nothing_changed_since_the_screen_was_built(two_table_round):
+    round_id, table1, _ = two_table_round
+    before = dict(zip(table1, GUEST_T1))
+    db.submit_guest_round_results(round_id, before, {})
+
+    corrected = {**before, table1[0]: 46000, table1[1]: 34000}
+    db.save_round_results(round_id, corrected, {}, expected_scores=before, expected_busters={})
+
+    assert db.get_round_results(round_id) == corrected
