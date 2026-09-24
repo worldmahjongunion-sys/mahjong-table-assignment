@@ -301,12 +301,18 @@ def render_guest_view(guest_token: str) -> None:
                 width="stretch",
                 key=f"guest_submit_{selected_round_id}_{selected_table_number}",
             ):
-                try:
-                    db.submit_guest_round_results(selected_round_id, raw_scores_input, tobi_busters_input)
-                    st.success("送信しました。")
-                    st.rerun()
-                except db.ResultsAlreadySubmittedError:
-                    st.warning("すでに入力済みです。ページを再読み込みしてください。")
+                # ボタンを押せなくするだけでは足りない: 素点を書き換えてすぐ送信ボタンを押すと、
+                # 書き換えと押下が同じ再実行で届き(ボタンは直前の画面では押せる状態だった)、
+                # ここに合計のずれた値のまま来る。ゲストの送信は修正できないので、送信時にも確かめる。
+                if not (sum_ok and confirm):
+                    st.error("送信できませんでした。合計と確認のチェックを見直してから、もう一度送信してください。")
+                else:
+                    try:
+                        db.submit_guest_round_results(selected_round_id, raw_scores_input, tobi_busters_input)
+                        st.success("送信しました。")
+                        st.rerun()
+                    except db.ResultsAlreadySubmittedError:
+                        st.warning("すでに入力済みです。ページを再読み込みしてください。")
 
     st.divider()
     st.write("**大会内順位表**")
