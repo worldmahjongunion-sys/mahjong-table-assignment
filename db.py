@@ -1170,19 +1170,75 @@ def get_round_absences(round_id: int) -> list[int]:
 
 # ---- results (成績) ----
 
-def save_round_results(round_id: int, raw_scores: dict, tobi_busters: dict) -> None:
+class ResultsChangedError(Exception):
+    """主催者が保存しようとした卓の成績が、主催者の画面を作ったときから変わっていた
+    （その間に他の人＝ゲストや別の主催者が入力した）。何も保存していない。"""
+
+
+def save_round_results(
+    round_id: int,
+    raw_scores: dict,
+    tobi_busters: dict,
+    expected_scores: dict | None = None,
+    expected_busters: dict | None = None,
+) -> None:
     """主催者による成績の入力・修正。素点と飛び賞の「誰が飛ばしたか」を保存する。
 
-    raw_scores: {member_id: 素点}
+    raw_scores: {member_id: 素点}。保存する卓の全員分を渡す
     tobi_busters: {飛んだmember_id: [飛ばしたmember_id, ...]}
-    既存レコードがあれば削除してから入れ直す（成績入力の修正に対応するため。
-    ゲストによる新規入力は上書きしないsubmit_guest_round_resultsを使う）。
+    raw_scoresに含まれる選手の既存レコードだけを削除してから入れ直す（成績入力の修正に
+    対応するため）。回戦全体は消さない: 主催者の画面に出ていない卓（画面を作った後に
+    ゲストが送信した卓）の成績まで消してしまうため。ゲストによる新規入力は上書きしない
+    submit_guest_round_resultsを使う。
     入力経路は常に'admin'として記録する（ゲスト向け画面実装依頼_Stage2.md 3.5対応）。
+
+    expected_scores / expected_busters: 主催者の画面を作ったときに読んだ、保存する選手の
+    素点({member_id: 素点 or None(未入力)})と飛び賞({飛んだmember_id: [...]})。渡すと、
+    保存の直前(書き込みロックを取った後)に今のDBの値と比べ、食い違っていれば何も保存せず
+    ResultsChangedErrorを送出する。画面を作ってから保存するまでの間にゲストが送信した
+    成績を、主催者の古い値で上書きしないため。
     """
     now = _iso(_now())
-    with get_connection() as conn:
-        conn.execute("DELETE FROM results WHERE round_id = ?", (round_id,))
-        conn.execute("DELETE FROM tobi_busters WHERE round_id = ?", (round_id,))
+    member_ids = list(raw_scores)
+    placeholders = ",".join("?" * len(member_ids))
+    # BEGIN IMMEDIATEで書き込みロックを先に取り、「比べる」と「書き換える」の間に
+    # ゲストの送信が割り込めないようにする(add_memberと同じ方式)。
+    conn = sqlite3.connect(DB_PATH, isolation_level=None)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("BEGIN IMMEDIATE")
+        if expected_scores is not None and member_ids:
+            current_scores = {
+                row[0]: row[1]
+                for row in conn.execute(
+                    f"SELECT member_id, raw_score FROM results WHERE round_id = ? AND member_id IN ({placeholders})",
+                    (round_id, *member_ids),
+                )
+            }
+            current_busters: dict[int, list[int]] = {}
+            for busted, buster in conn.execute(
+                f"SELECT busted_member_id, buster_member_id FROM tobi_busters "
+                f"WHERE round_id = ? AND busted_member_id IN ({placeholders})",
+                (round_id, *member_ids),
+            ):
+                current_busters.setdefault(busted, []).append(buster)
+            scores_changed = any(current_scores.get(m) != expected_scores.get(m) for m in member_ids)
+            busters_changed = any(
+                sorted(current_busters.get(m, [])) != sorted((expected_busters or {}).get(m, []))
+                for m in member_ids
+            )
+            if scores_changed or busters_changed:
+                conn.execute("ROLLBACK")
+                raise ResultsChangedError(round_id)
+        if member_ids:
+            conn.execute(
+                f"DELETE FROM results WHERE round_id = ? AND member_id IN ({placeholders})",
+                (round_id, *member_ids),
+            )
+            conn.execute(
+                f"DELETE FROM tobi_busters WHERE round_id = ? AND busted_member_id IN ({placeholders})",
+                (round_id, *member_ids),
+            )
         for member_id, raw_score in raw_scores.items():
             conn.execute(
                 "INSERT INTO results (round_id, member_id, raw_score, created_at, input_source) "
@@ -1196,6 +1252,14 @@ def save_round_results(round_id: int, raw_scores: dict, tobi_busters: dict) -> N
                     "VALUES (?, ?, ?, ?, 'admin')",
                     (round_id, busted_member_id, buster_member_id, now),
                 )
+        conn.execute("COMMIT")
+    except ResultsChangedError:
+        raise
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
 
 
 class ResultsAlreadySubmittedError(Exception):

@@ -1461,6 +1461,22 @@ for tournament in tournaments:
             existing_busters = db.get_round_tobi_busters(selected_round_id)
             member_id_to_name = {tm["member_id"]: tm["member_name"] for tm in tournament_members}
 
+            # 入力欄の値はStreamlitがセッションに覚えていて、作られた後はDBが変わっても
+            # 自動では変わらない(画面を開いた後にゲストが送信した卓は、再表示されても0のまま)。
+            # そこで「入力欄が作られたときのDBの値」を選手ごとに覚えておき(score_basis)、
+            # 今のDBの値と食い違う卓は「他の人が入力済み」として保存対象から外す。
+            # 主催者が自分で値を書き換えた卓は、DBが変わっていなければ食い違いにならない
+            # (＝ゲストの入力の修正はこれまでどおりできる)。
+            score_basis = st.session_state.setdefault(f"score_basis_{selected_round_id}", {})
+            for seat in seats:
+                member_id = seat["member_id"]
+                if f"score_{selected_round_id}_{member_id}" not in st.session_state or member_id not in score_basis:
+                    # この再実行で入力欄が(作り直しを含めて)DBの値から作られる
+                    score_basis[member_id] = (
+                        existing_scores.get(member_id),
+                        sorted(existing_busters.get(member_id, [])),
+                    )
+
             by_table: dict[int, list] = {}
             for seat in seats:
                 by_table.setdefault(seat["table_number"], []).append(seat)
@@ -1519,23 +1535,46 @@ for tournament in tournaments:
                         if chosen_busters:
                             tobi_busters_input[member_id] = chosen_busters
 
+                entered_by_someone_else = any(
+                    (existing_scores.get(mid), sorted(existing_busters.get(mid, []))) != score_basis[mid]
+                    for mid in table_member_ids
+                )
+                if entered_by_someone_else:
+                    # 合計エラー(古い入力欄の0など)を出す代わりに再読み込みを促し、この卓は保存しない
+                    st.warning(
+                        f"卓{table_number}は他の人が入力済みです。ページを再読み込みしてください"
+                        "（この卓は保存されません）。"
+                    )
+                    continue
+
                 already_entered = any(mid in existing_scores for mid in table_member_ids)
                 touched = any(raw_scores_input[mid] != 0 for mid in table_member_ids)
-                if already_entered or touched:
+                # 入力済みの卓は、値を変えたときだけ入れ直す(変えていない卓を入れ直すと、
+                # ゲストの入力が「主催者の入力」として記録し直されてしまう)
+                changed = any(
+                    raw_scores_input[mid] != existing_scores.get(mid)
+                    or sorted(tobi_busters_input.get(mid, [])) != sorted(existing_busters.get(mid, []))
+                    for mid in table_member_ids
+                )
+                will_save = changed if already_entered else touched
+                if will_save:
                     save_tables[table_number] = table_member_ids
+                if already_entered or touched:
                     if not all(
                         scoring_logic.is_hundreds_input_plausible(raw_scores_input[mid]) for mid in table_member_ids
                     ):
                         # 桁がおかしい入力(45,800点を45800と入力した等)は、合計のずれではなく
                         # 単位の誤りとして知らせる
-                        implausible_tables.append(table_number)
+                        if will_save:
+                            implausible_tables.append(table_number)
                         st.error(f"卓{table_number}: {scoring_logic.HUNDREDS_OUT_OF_RANGE_MESSAGE}")
                     elif expected_total is not None:
                         table_total = sum(raw_scores_input[mid] for mid in table_member_ids)
                         if table_total == expected_total:
                             st.caption(f"卓{table_number}の合計 {scoring_logic.format_hundreds(table_total)}")
                         else:
-                            mismatched_tables.append(table_number)
+                            if will_save:
+                                mismatched_tables.append(table_number)
                             st.error(
                                 f"卓{table_number}の合計が{scoring_logic.format_hundreds(table_total)}です。"
                                 f"{scoring_logic.format_hundreds(expected_total)}になるよう確認してください。"
@@ -1564,9 +1603,30 @@ for tournament in tournaments:
                             scores_to_save[mid] = raw_scores_input[mid]
                             if mid in tobi_busters_input:
                                 busters_to_save[mid] = tobi_busters_input[mid]
-                    db.save_round_results(selected_round_id, scores_to_save, busters_to_save)
-                    st.success("成績を保存しました。")
-                    st.rerun()
+                    if not scores_to_save:
+                        st.info("保存する変更はありません。")
+                    else:
+                        try:
+                            # 画面を作ったときに読んだ値を渡し、保存の直前にDBと比べる(その間に
+                            # ゲストが送信していたら、主催者の値で上書きせずに止める)
+                            db.save_round_results(
+                                selected_round_id,
+                                scores_to_save,
+                                busters_to_save,
+                                expected_scores={mid: existing_scores.get(mid) for mid in scores_to_save},
+                                expected_busters={mid: existing_busters.get(mid, []) for mid in scores_to_save},
+                            )
+                        except db.ResultsChangedError:
+                            st.error(
+                                "保存できませんでした。保存の直前に他の人がこの回戦の成績を入力しました。"
+                                "ページを再読み込みしてから、もう一度保存してください。"
+                            )
+                        else:
+                            # 自分の保存でDBが変わった分は「他の人の入力」扱いにしない
+                            for mid, score in scores_to_save.items():
+                                score_basis[mid] = (score, sorted(busters_to_save.get(mid, [])))
+                            st.success("成績を保存しました。")
+                            st.rerun()
 
             if existing_scores:
                 totals = tournament_service.compute_round_totals(tournament, selected_round_id)

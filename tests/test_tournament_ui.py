@@ -865,3 +865,146 @@ def test_tournament_edit_form_rejects_wrong_digits(app_env):
 
     assert any("100点単位で入力してください(例:45,800点なら458)" in e.value for e in at.error)
     assert db.get_tournament(tenant_id, tournament_id)["scoring_config"]["start_point"] == 35000  # 変わっていない
+
+
+# ---------------------------------------------------------------------------
+# 主催者画面を開いている間にゲストが送信したとき（10/2前の修正）
+#
+# 主催者画面の入力欄はStreamlitが前回の値を覚えているため、ゲストが送信した後に画面が
+# 再表示されても、その卓の欄は古い値(未入力なら0)のまま残る。主催者はそれに気づけない。
+# ---------------------------------------------------------------------------
+
+GUEST_T1 = (45000, 35000, 32000, 28000)   # ゲストが送る卓1(合計140000)
+ADMIN_T2 = (60000, 40000, 30000, 10000)   # 主催者が入れる卓2(合計140000)
+STALE_TABLE_MESSAGE = "卓1は他の人が入力済みです。ページを再読み込みしてください"
+CHANGED_JUST_BEFORE_SAVE_MESSAGE = "保存の直前に他の人がこの回戦の成績を入力しました"
+
+
+def _open_admin(app_env_unused=None):
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+    return at
+
+
+def test_stale_admin_screen_shows_reload_message_and_still_saves_other_tables(app_env):
+    """主催者が画面を開いた後にゲストが卓1を送信。主催者はそのまま卓2を入力して保存する。
+    卓1は「0の合計エラー」で保存全体を止めるのではなく、再読み込みを促して卓1だけ保存対象から外す。"""
+    _, _, round_id, table1, table2 = _setup_two_table_round()
+    at = _open_admin()
+    db.submit_guest_round_results(round_id, dict(zip(table1, GUEST_T1)), {})  # 別の端末から
+
+    _set_admin_scores(at, dict(zip(table2, ADMIN_T2)))
+    assert any(STALE_TABLE_MESSAGE in w.value for w in at.warning)
+    assert not any("卓1の合計が" in e.value for e in at.error)
+
+    at.button[_find_button(at, "成績を保存")].click().run()
+
+    assert not at.exception
+    saved = db.get_round_results(round_id)
+    assert [saved[m] for m in table1] == list(GUEST_T1)
+    assert [saved[m] for m in table2] == list(ADMIN_T2)
+    meta = db.get_round_result_meta(round_id)
+    assert all(meta[m]["input_source"] == "guest" for m in table1)
+
+
+def test_stale_admin_screen_cannot_overwrite_the_table_someone_else_entered(app_env):
+    """古い画面のまま、主催者が卓1(ゲストが送信済み)に合計の合う別の数字を打ち込んでも上書きされない。"""
+    _, _, round_id, table1, _ = _setup_two_table_round()
+    at = _open_admin()
+    db.submit_guest_round_results(round_id, dict(zip(table1, GUEST_T1)), {})
+
+    _set_admin_scores(at, dict(zip(table1, ADMIN_T2)))
+    at.button[_find_button(at, "成績を保存")].click().run()
+
+    assert not at.exception
+    assert any(STALE_TABLE_MESSAGE in w.value for w in at.warning)
+    assert [db.get_round_results(round_id)[m] for m in table1] == list(GUEST_T1)
+
+
+def test_guest_submission_during_admin_save_is_not_lost(app_env, monkeypatch):
+    """主催者の保存の再実行が画面を作り終えてから保存するまでの間に、ゲストが別の卓を送信した。"""
+    _, _, round_id, table1, table2 = _setup_two_table_round()
+    at = _open_admin()
+    _set_admin_scores(at, dict(zip(table2, ADMIN_T2)))
+    original_save = db.save_round_results
+
+    def guest_slips_in(*args, **kwargs):
+        db.submit_guest_round_results(round_id, dict(zip(table1, GUEST_T1)), {})
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(db, "save_round_results", guest_slips_in)
+    at.button[_find_button(at, "成績を保存")].click().run()
+
+    assert not at.exception
+    saved = db.get_round_results(round_id)
+    assert [saved[m] for m in table1] == list(GUEST_T1)
+    assert [saved[m] for m in table2] == list(ADMIN_T2)
+
+
+def test_admin_save_stops_when_guest_submits_the_same_table_just_before(app_env, monkeypatch):
+    """主催者が卓1を入力して保存する直前に、ゲストも卓1を送信した: 主催者の保存を止めて知らせる。"""
+    _, _, round_id, table1, _ = _setup_two_table_round()
+    at = _open_admin()
+    _set_admin_scores(at, dict(zip(table1, ADMIN_T2)))
+    original_save = db.save_round_results
+
+    def guest_slips_in(*args, **kwargs):
+        db.submit_guest_round_results(round_id, dict(zip(table1, GUEST_T1)), {})
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(db, "save_round_results", guest_slips_in)
+    at.button[_find_button(at, "成績を保存")].click().run()
+
+    assert not at.exception
+    assert any(CHANGED_JUST_BEFORE_SAVE_MESSAGE in e.value for e in at.error)
+    assert [db.get_round_results(round_id)[m] for m in table1] == list(GUEST_T1)
+
+
+def test_admin_save_keeps_guest_input_source_for_tables_it_did_not_change(app_env):
+    """ゲスト入力済みの卓1を主催者が触らずに卓2だけ保存しても、卓1は「ゲストの入力」のまま残る。"""
+    _, _, round_id, table1, table2 = _setup_two_table_round()
+    db.submit_guest_round_results(round_id, dict(zip(table1, GUEST_T1)), {})
+    before = db.get_round_result_meta(round_id)
+    at = _open_admin()  # ゲスト送信の後に開いた画面(古くない)
+
+    _set_admin_scores(at, dict(zip(table2, ADMIN_T2)))
+    at.button[_find_button(at, "成績を保存")].click().run()
+
+    assert not at.exception
+    after = db.get_round_result_meta(round_id)
+    assert all(after[m]["input_source"] == "guest" for m in table1)
+    assert all(after[m]["created_at"] == before[m]["created_at"] for m in table1)
+    assert [db.get_round_results(round_id)[m] for m in table2] == list(ADMIN_T2)
+
+
+def test_admin_can_still_correct_a_table_entered_by_a_guest(app_env):
+    """画面を開く前にゲストが送信した卓を主催者が修正するのは、これまでどおりできる。"""
+    _, _, round_id, table1, _ = _setup_two_table_round()
+    db.submit_guest_round_results(round_id, dict(zip(table1, GUEST_T1)), {})
+    at = _open_admin()
+
+    corrected = dict(zip(table1, (46000, 34000, 32000, 28000)))
+    _set_admin_scores(at, corrected)
+    assert not any(STALE_TABLE_MESSAGE in w.value for w in at.warning)
+    at.button[_find_button(at, "成績を保存")].click().run()
+
+    assert not at.exception
+    assert {m: db.get_round_results(round_id)[m] for m in table1} == corrected
+    assert all(db.get_round_result_meta(round_id)[m]["input_source"] == "admin" for m in table1)
+
+
+def test_admin_screen_is_not_stale_after_its_own_save(app_env):
+    """主催者自身の保存の後は「他の人が入力済み」扱いにならず、続けて修正・保存できる。"""
+    _, _, round_id, table1, _ = _setup_two_table_round()
+    at = _open_admin()
+    _set_admin_scores(at, dict(zip(table1, ADMIN_T2)))
+    at.button[_find_button(at, "成績を保存")].click().run()
+    assert not any(STALE_TABLE_MESSAGE in w.value for w in at.warning)
+
+    _set_admin_scores(at, {table1[0]: 61000, table1[1]: 39000})
+    at.button[_find_button(at, "成績を保存")].click().run()
+
+    assert not at.exception
+    assert not any(STALE_TABLE_MESSAGE in w.value for w in at.warning)
+    assert [db.get_round_results(round_id)[m] for m in table1] == [61000, 39000, 30000, 10000]
