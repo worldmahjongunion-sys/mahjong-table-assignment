@@ -12,9 +12,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 本番(Railway)と同じPythonで確かめる。「GitHubでは緑なのに本番で落ちる」ずれを防ぐため
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
 
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
