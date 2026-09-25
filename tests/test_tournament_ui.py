@@ -32,6 +32,9 @@ SCORE_CONFIG = {
 
 POINT_CONFIG = {"rank_point_table": [3, 1, -1, -3], "start_point": 35000}
 
+# サークルの通常の大会と同じ開始点数30,000点（画面の入力は300、4人の合計は1200）
+SCORE_CONFIG_30000 = {**SCORE_CONFIG, "start_point": 30000}
+
 
 @pytest.fixture
 def app_env(tmp_path, monkeypatch):
@@ -327,7 +330,7 @@ def _setup_tournament_with_round(scoring_mode="得点", scoring_config=SCORE_CON
     user_id, tenant_id, member_ids, tournament_id = _setup_admin_with_tournament()
     for i, member_id in enumerate(member_ids, start=1):
         db.add_tournament_member(tournament_id, member_id, i)
-    if scoring_mode != "得点":
+    if (scoring_mode, scoring_config) != ("得点", SCORE_CONFIG):
         db.update_tournament(
             tenant_id, tournament_id, "テスト大会", "ワンデー", "蛇行", scoring_mode,
             scoring_config, "受付順", None, None, "準備中",
@@ -475,6 +478,48 @@ def test_guest_submit_rechecks_sum_when_a_score_is_edited_and_submitted_at_once(
     assert not at.exception
     assert db.get_round_results(db.get_rounds(tournament_id)[0]["id"]) == {}  # 保存されない
     assert any("送信できませんでした" in e.value for e in at.error)
+
+
+# 合計チェックの境界値（開始点数30,000点＝合計1200）。「ちょうど」だけが通り、
+# 100点（入力の1目盛り）多くても少なくても止まることを守る。
+# 「足りないときだけ弾く」「多いときだけ弾く」のような片側だけの壊れ方もここで赤になる。
+SUM_BOUNDARY_CASES = [
+    pytest.param([458, 342, 250, 150], True, id="ちょうど1200→送信できる"),
+    pytest.param([458, 342, 250, 151], False, id="100点多い1201→送信できない"),
+    pytest.param([458, 342, 250, 149], False, id="100点少ない1199→送信できない"),
+]
+
+
+@pytest.mark.parametrize("hundreds, accepted", SUM_BOUNDARY_CASES)
+def test_guest_sum_boundary_at_start_point_30000(app_env, hundreds, accepted):
+    """ゲストの代表者送信: 合計が開始点数×4（30,000×4＝1200）ぴったりのときだけ保存される。"""
+    user_id, tenant_id, member_ids, tournament_id, raw_token = _setup_tournament_with_round(
+        scoring_config=SCORE_CONFIG_30000
+    )
+
+    at = AppTest.from_file(APP_PATH)
+    at.query_params["guest"] = raw_token
+    at.run()
+    score_inputs = [ni for ni in at.number_input if ni.key and ni.key.startswith("guest_score_")]
+    for ni, v in zip(score_inputs, hundreds):
+        ni.set_value(v)
+    at.checkbox[0].check()
+    at.run()
+
+    submit_btn = at.button[_find_button(at, "この内容で送信する")]
+    saved = db.get_round_results(db.get_rounds(tournament_id)[0]["id"])
+    if accepted:
+        assert not submit_btn.disabled
+        submit_btn.click().run()
+        assert not at.exception
+        saved = db.get_round_results(db.get_rounds(tournament_id)[0]["id"])
+        assert sorted(saved.values(), reverse=True) == [45800, 34200, 25000, 15000]
+    else:
+        assert submit_btn.disabled
+        assert any(
+            f"合計が{sum(hundreds)}です。1200になるよう確認してください。" in e.value for e in at.error
+        )
+        assert saved == {}
 
 
 def test_guest_view_already_submitted_table_is_read_only(app_env):
@@ -632,6 +677,36 @@ def test_admin_correction_of_saved_table_is_also_checked(app_env):
     at.button[_find_button(at, "成績を保存")].click().run()
 
     assert db.get_round_results(round_id) == original
+
+
+@pytest.mark.parametrize("hundreds, accepted", SUM_BOUNDARY_CASES)
+def test_admin_sum_boundary_at_start_point_30000(app_env, hundreds, accepted):
+    """主催者画面での保存: 卓1はぴったり1200、卓2を境界値にする。卓2がずれていれば
+    どちらの卓も保存されず、ぴったりなら両方保存される（9/19時点では合計チェックが無かった）。"""
+    _, tournament_id, round_id, table1, table2 = _setup_two_table_round(
+        scoring_config=SCORE_CONFIG_30000
+    )
+    scores = {
+        **dict(zip(table1, (40000, 35000, 30000, 15000))),  # 合計120000（ぴったり）
+        **dict(zip(table2, (v * 100 for v in hundreds))),
+    }
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+    _set_admin_scores(at, scores)
+    at.button[_find_button(at, "成績を保存")].click().run()
+
+    assert not at.exception
+    assert not any("卓1の合計が" in e.value for e in at.error)
+    if accepted:
+        assert db.get_round_results(round_id) == scores
+    else:
+        assert any(
+            f"卓2の合計が{sum(hundreds)}です。1200になるよう確認してください。" in e.value for e in at.error
+        )
+        assert any("保存できません" in e.value and "卓2" in e.value for e in at.error)
+        assert db.get_round_results(round_id) == {}
 
 
 def test_admin_save_blocked_when_start_point_is_missing(app_env):
