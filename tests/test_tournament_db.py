@@ -1,0 +1,463 @@
+"""大会管理とゲスト共有リンク実装依頼.md 4章のテスト観点のうち、db.py（DBアクセス層）
+のCRUD操作を検証する。"""
+import pytest
+
+import db
+
+
+@pytest.fixture
+def temp_db(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db, "DB_PATH", db_path)
+    db.init_db()
+    return db_path
+
+
+@pytest.fixture
+def tenant_and_members(temp_db):
+    user_id = db.add_user("owner", "hash")
+    tenant_id = db.get_user_by_username("owner")["tenant_id"]
+    member_ids = [db.add_member(tenant_id, user_id, name, "") for name in ("Alice", "Bob", "Carol", "Dave")]
+    return {"user_id": user_id, "tenant_id": tenant_id, "member_ids": member_ids}
+
+
+SCORE_CONFIG = {
+    "start_point": 35000,
+    "return_point": 40000,
+    "oka": 20000,
+    "tobi_amount": 1000,
+    "uma_table": {
+        1: [48000, -8000, -16000, -24000],
+        2: [24000, 8000, -8000, -24000],
+        3: [12000, 8000, 4000, -24000],
+    },
+}
+POINT_CONFIG = {"rank_point_table": [3, 1, -1, -3]}
+
+
+# ---------------------------------------------------------------------------
+# tournaments
+# ---------------------------------------------------------------------------
+
+def test_create_and_get_tournament(tenant_and_members):
+    tenant_id = tenant_and_members["tenant_id"]
+    tid = db.create_tournament(
+        tenant_id, "第1回道場", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    tournament = db.get_tournament(tenant_id, tid)
+
+    assert tournament["name"] == "第1回道場"
+    assert tournament["status"] == "準備中"
+    assert tournament["scoring_config"]["uma_table"][1] == [48000, -8000, -16000, -24000]
+    # JSON往復後もintキーに戻っていること
+    assert all(isinstance(k, int) for k in tournament["scoring_config"]["uma_table"])
+
+
+def test_create_tournament_rejects_invalid_choice(tenant_and_members):
+    tenant_id = tenant_and_members["tenant_id"]
+    with pytest.raises(ValueError):
+        db.create_tournament(tenant_id, "不正", "月例", "蛇行", "得点", SCORE_CONFIG, "受付順")
+
+
+def test_get_tournaments_is_scoped_to_tenant(temp_db):
+    user_a = db.add_user("owner_a", "hash")
+    tenant_a = db.get_user_by_username("owner_a")["tenant_id"]
+    user_b = db.add_user("owner_b", "hash")
+    tenant_b = db.get_user_by_username("owner_b")["tenant_id"]
+
+    db.create_tournament(tenant_a, "Aの大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順")
+    db.create_tournament(tenant_b, "Bの大会", "ワンデー", "ワンデー4半荘", "ポイント", POINT_CONFIG, "くじ引き")
+
+    names_a = [t["name"] for t in db.get_tournaments(tenant_a)]
+    assert names_a == ["Aの大会"]
+
+
+def test_update_tournament(tenant_and_members):
+    tenant_id = tenant_and_members["tenant_id"]
+    tid = db.create_tournament(
+        tenant_id, "元の名前", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    db.update_tournament(
+        tenant_id, tid, "新しい名前", "シーズン", "ワンデー4半荘", "ポイント",
+        POINT_CONFIG, "くじ引き", "2026-01-01", "2026-12-31", "進行中",
+    )
+    tournament = db.get_tournament(tenant_id, tid)
+
+    assert tournament["name"] == "新しい名前"
+    assert tournament["scoring_mode"] == "ポイント"
+    assert tournament["scoring_config"] == POINT_CONFIG
+    assert tournament["status"] == "進行中"
+
+
+def test_delete_tournament_cascades_related_records(tenant_and_members):
+    tenant_id = tenant_and_members["tenant_id"]
+    member_ids = tenant_and_members["member_ids"]
+    tid = db.create_tournament(
+        tenant_id, "削除対象", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    for i, member_id in enumerate(member_ids, start=1):
+        db.add_tournament_member(tid, member_id, i)
+    round_id = db.save_round(
+        tid, 1, [dict(zip(("東", "南", "西", "北"), member_ids))], []
+    )
+    db.save_round_results(round_id, {mid: 30000 for mid in member_ids}, {})
+    db.create_guest_link(tid, tenant_and_members["user_id"])
+
+    db.delete_tournament(tenant_id, tid)
+
+    assert db.get_tournament(tenant_id, tid) is None
+    assert db.get_tournament_members(tid) == []
+    assert db.get_rounds(tid) == []
+
+
+# ---------------------------------------------------------------------------
+# tournament members
+# ---------------------------------------------------------------------------
+
+def test_add_tournament_member_and_auto_numbering(tenant_and_members):
+    tenant_id = tenant_and_members["tenant_id"]
+    member_ids = tenant_and_members["member_ids"]
+    tid = db.create_tournament(
+        tenant_id, "受付順大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+
+    for member_id in member_ids:
+        pn = db.next_tournament_player_number(tid)
+        db.add_tournament_member(tid, member_id, pn)
+
+    members = db.get_tournament_members(tid)
+    assert [m["player_number"] for m in members] == [1, 2, 3, 4]
+    assert [m["member_name"] for m in members] == ["Alice", "Bob", "Carol", "Dave"]
+
+
+def test_add_tournament_member_duplicate_player_number_raises(tenant_and_members):
+    tenant_id = tenant_and_members["tenant_id"]
+    member_ids = tenant_and_members["member_ids"]
+    tid = db.create_tournament(
+        tenant_id, "くじ引き大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "くじ引き"
+    )
+    db.add_tournament_member(tid, member_ids[0], 7)
+    with pytest.raises(db.PlayerNumberTakenError):
+        db.add_tournament_member(tid, member_ids[1], 7)
+
+
+def test_add_tournament_member_same_member_twice_raises(tenant_and_members):
+    tenant_id = tenant_and_members["tenant_id"]
+    member_ids = tenant_and_members["member_ids"]
+    tid = db.create_tournament(
+        tenant_id, "大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    db.add_tournament_member(tid, member_ids[0], 1)
+    with pytest.raises(db.MemberAlreadyRegisteredError):
+        db.add_tournament_member(tid, member_ids[0], 2)
+
+
+# ---------------------------------------------------------------------------
+# rounds / tables / seats / absences
+# ---------------------------------------------------------------------------
+
+def test_save_round_and_read_back(tenant_and_members):
+    tenant_id = tenant_and_members["tenant_id"]
+    member_ids = tenant_and_members["member_ids"]
+    tid = db.create_tournament(
+        tenant_id, "大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    tables = [dict(zip(("東", "南", "西", "北"), member_ids))]
+    round_id = db.save_round(tid, 1, tables, [])
+
+    assert db.count_rounds(tid) == 1
+    rounds = db.get_rounds(tid)
+    assert rounds[0]["round_number"] == 1
+
+    seats = db.get_round_seats(round_id)
+    assert len(seats) == 4
+    seat_map = {s["position"]: s["member_id"] for s in seats}
+    assert seat_map["東"] == member_ids[0]
+    assert seat_map["北"] == member_ids[3]
+    assert db.get_round_absences(round_id) == []
+
+
+def test_save_round_with_absences(tenant_and_members):
+    tenant_id = tenant_and_members["tenant_id"]
+    member_ids = tenant_and_members["member_ids"]
+    tid = db.create_tournament(
+        tenant_id, "大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    round_id = db.save_round(tid, 1, [], [member_ids[0], member_ids[1]])
+    assert set(db.get_round_absences(round_id)) == {member_ids[0], member_ids[1]}
+
+
+def test_multiple_rounds_are_ordered_by_round_number(tenant_and_members):
+    tenant_id = tenant_and_members["tenant_id"]
+    member_ids = tenant_and_members["member_ids"]
+    tid = db.create_tournament(
+        tenant_id, "大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    tables = [dict(zip(("東", "南", "西", "北"), member_ids))]
+    db.save_round(tid, 1, tables, [])
+    db.save_round(tid, 2, tables, [])
+    rounds = db.get_rounds(tid)
+    assert [r["round_number"] for r in rounds] == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# results / tobi_busters
+# ---------------------------------------------------------------------------
+
+def test_save_and_get_round_results(tenant_and_members):
+    tenant_id = tenant_and_members["tenant_id"]
+    member_ids = tenant_and_members["member_ids"]
+    tid = db.create_tournament(
+        tenant_id, "大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    round_id = db.save_round(tid, 1, [dict(zip(("東", "南", "西", "北"), member_ids))], [])
+
+    raw_scores = {member_ids[0]: 45000, member_ids[1]: -2000, member_ids[2]: 25000, member_ids[3]: 32000}
+    tobi_busters = {member_ids[1]: [member_ids[0], member_ids[2]]}
+    db.save_round_results(round_id, raw_scores, tobi_busters)
+
+    assert db.get_round_results(round_id) == raw_scores
+    assert db.get_round_tobi_busters(round_id) == tobi_busters
+
+
+def test_save_round_results_overwrites_previous_entry(tenant_and_members):
+    tenant_id = tenant_and_members["tenant_id"]
+    member_ids = tenant_and_members["member_ids"]
+    tid = db.create_tournament(
+        tenant_id, "大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    round_id = db.save_round(tid, 1, [dict(zip(("東", "南", "西", "北"), member_ids))], [])
+
+    db.save_round_results(round_id, {member_ids[0]: 10000}, {})
+    db.save_round_results(round_id, {member_ids[0]: 20000}, {})
+
+    assert db.get_round_results(round_id) == {member_ids[0]: 20000}
+
+
+def test_save_round_results_records_admin_as_input_source(tenant_and_members):
+    """ゲスト向け画面実装依頼_Stage2.md 3.5対応: 主催者による修正は入力経路'admin'・
+    入力日時を記録する。"""
+    tenant_id = tenant_and_members["tenant_id"]
+    member_ids = tenant_and_members["member_ids"]
+    tid = db.create_tournament(
+        tenant_id, "大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    round_id = db.save_round(tid, 1, [dict(zip(("東", "南", "西", "北"), member_ids))], [])
+
+    db.save_round_results(round_id, {member_ids[0]: 10000}, {})
+    meta = db.get_round_result_meta(round_id)
+
+    assert meta[member_ids[0]]["input_source"] == "admin"
+    assert meta[member_ids[0]]["created_at"]
+
+    # 修正すると入力日時が更新される
+    first_created_at = meta[member_ids[0]]["created_at"]
+    db.save_round_results(round_id, {member_ids[0]: 20000}, {})
+    meta_after_edit = db.get_round_result_meta(round_id)
+    assert meta_after_edit[member_ids[0]]["input_source"] == "admin"
+    assert meta_after_edit[member_ids[0]]["created_at"] >= first_created_at
+
+
+def test_submit_guest_round_results_records_guest_as_input_source(tenant_and_members):
+    tenant_id = tenant_and_members["tenant_id"]
+    member_ids = tenant_and_members["member_ids"]
+    tid = db.create_tournament(
+        tenant_id, "大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    round_id = db.save_round(tid, 1, [dict(zip(("東", "南", "西", "北"), member_ids))], [])
+
+    raw_scores = {mid: 25000 for mid in member_ids}
+    db.submit_guest_round_results(round_id, raw_scores, {})
+
+    assert db.get_round_results(round_id) == raw_scores
+    meta = db.get_round_result_meta(round_id)
+    assert all(m["input_source"] == "guest" for m in meta.values())
+    assert all(m["created_at"] for m in meta.values())
+
+
+def test_submit_guest_round_results_negative_score_round_trips(tenant_and_members):
+    tenant_id = tenant_and_members["tenant_id"]
+    member_ids = tenant_and_members["member_ids"]
+    tid = db.create_tournament(
+        tenant_id, "大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    round_id = db.save_round(tid, 1, [dict(zip(("東", "南", "西", "北"), member_ids))], [])
+
+    raw_scores = {member_ids[0]: 60000, member_ids[1]: 30000, member_ids[2]: 15000, member_ids[3]: -5000}
+    tobi_busters = {member_ids[3]: [member_ids[0]]}
+    db.submit_guest_round_results(round_id, raw_scores, tobi_busters)
+
+    assert db.get_round_results(round_id) == raw_scores
+    assert db.get_round_tobi_busters(round_id) == tobi_busters
+
+
+def test_submit_guest_round_results_rejects_resubmission_of_same_table(tenant_and_members):
+    """3.3「同じ卓に2人がほぼ同時に送信した場合、先に届いたものだけを確定」の
+    DB制約側の担保（UNIQUE制約によるIntegrityError→ResultsAlreadySubmittedError）。"""
+    tenant_id = tenant_and_members["tenant_id"]
+    member_ids = tenant_and_members["member_ids"]
+    tid = db.create_tournament(
+        tenant_id, "大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    round_id = db.save_round(tid, 1, [dict(zip(("東", "南", "西", "北"), member_ids))], [])
+
+    first_scores = {member_ids[0]: 40000, member_ids[1]: 30000, member_ids[2]: 20000, member_ids[3]: 10000}
+    db.submit_guest_round_results(round_id, first_scores, {})
+
+    second_scores = {member_ids[0]: 25000, member_ids[1]: 25000, member_ids[2]: 25000, member_ids[3]: 25000}
+    with pytest.raises(db.ResultsAlreadySubmittedError):
+        db.submit_guest_round_results(round_id, second_scores, {})
+
+    # 先に届いた内容がそのまま残り、後から届いた分は一切反映されない（部分的な上書きもされない）
+    assert db.get_round_results(round_id) == first_scores
+
+
+def test_submit_guest_round_results_rolls_back_entire_batch_on_partial_conflict(tenant_and_members):
+    """4人分のうち1人だけ既に確定済み(重複エラーの原因)の場合、残り3人分も含めて
+    一切保存されない(部分コミットされない)ことを確認する。
+
+    member_ids[2]だけを先に確定させ、残り3人(member_ids[0], [1], [3])は
+    まだ未確定の状態で4人分まとめて送信する。辞書のイテレーション順は挿入順
+    (member_ids[0]→[1]→[2]→[3])のため、[0]・[1]は一度INSERTに成功したあとで
+    [2]の重複によりIntegrityErrorが起きる。このとき[0]・[1]の分もロールバックされ、
+    一切保存されていないことを確認する（トランザクション全体のアトミック性）。
+    """
+    tenant_id = tenant_and_members["tenant_id"]
+    member_ids = tenant_and_members["member_ids"]
+    tid = db.create_tournament(
+        tenant_id, "大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    round_id = db.save_round(tid, 1, [dict(zip(("東", "南", "西", "北"), member_ids))], [])
+
+    db.submit_guest_round_results(round_id, {member_ids[2]: 99999}, {})
+
+    new_scores = {
+        member_ids[0]: 40000, member_ids[1]: 30000, member_ids[2]: 20000, member_ids[3]: 10000,
+    }
+    with pytest.raises(db.ResultsAlreadySubmittedError):
+        db.submit_guest_round_results(round_id, new_scores, {})
+
+    # member_ids[0], [1], [3]はどれも保存されておらず、member_ids[2]も元の値のまま
+    assert db.get_round_results(round_id) == {member_ids[2]: 99999}
+
+
+# ---------------------------------------------------------------------------
+# ゲスト共有リンク
+# ---------------------------------------------------------------------------
+
+def test_guest_link_token_resolves_to_tournament(tenant_and_members):
+    tenant_id = tenant_and_members["tenant_id"]
+    user_id = tenant_and_members["user_id"]
+    tid = db.create_tournament(
+        tenant_id, "ゲスト大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    raw_token = db.create_guest_link(tid, user_id)
+
+    resolved = db.get_tournament_by_guest_token(raw_token)
+    assert resolved is not None
+    assert resolved["id"] == tid
+
+
+def test_guest_link_unknown_token_does_not_resolve(tenant_and_members):
+    assert db.get_tournament_by_guest_token("no-such-token") is None
+
+
+def test_guest_link_revoked_token_does_not_resolve(tenant_and_members):
+    tenant_id = tenant_and_members["tenant_id"]
+    user_id = tenant_and_members["user_id"]
+    tid = db.create_tournament(
+        tenant_id, "ゲスト大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    raw_token = db.create_guest_link(tid, user_id)
+    link = db.get_active_guest_link(tid)
+    db.revoke_guest_link(link["id"])
+
+    assert db.get_tournament_by_guest_token(raw_token) is None
+    assert db.get_active_guest_link(tid) is None
+
+
+def test_get_active_guest_link_returns_none_when_not_issued(tenant_and_members):
+    tenant_id = tenant_and_members["tenant_id"]
+    tid = db.create_tournament(
+        tenant_id, "大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順"
+    )
+    assert db.get_active_guest_link(tid) is None
+
+
+# ---------------------------------------------------------------------------
+# 主催者の保存とゲストの送信が重なったとき（10/2前の修正）
+#
+# 主催者の保存は「保存する卓だけ」を入れ直す。回戦全体を消して入れ直すと、主催者の画面に
+# 出ていない卓(＝画面を作った後にゲストが送信した卓)の成績が消えてしまうため。
+# また、保存する卓の成績が「主催者の画面を作ったとき」から変わっていたら、他の人が
+# 入力したものとして保存しない(ResultsChangedError)。
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def two_table_round(tenant_and_members):
+    tenant_id = tenant_and_members["tenant_id"]
+    user_id = tenant_and_members["user_id"]
+    more = [db.add_member(tenant_id, user_id, name, "") for name in ("Eve", "Frank", "Grace", "Heidi")]
+    table1, table2 = tenant_and_members["member_ids"], more
+    tid = db.create_tournament(tenant_id, "大会", "ワンデー", "蛇行", "得点", SCORE_CONFIG, "受付順")
+    winds = ("東", "南", "西", "北")
+    round_id = db.save_round(tid, 1, [dict(zip(winds, table1)), dict(zip(winds, table2))], [])
+    return round_id, table1, table2
+
+
+GUEST_T1 = (45000, 35000, 32000, 28000)
+ADMIN_T2 = (60000, 40000, 30000, 10000)
+
+
+def test_admin_save_replaces_only_the_tables_being_saved(two_table_round):
+    round_id, table1, table2 = two_table_round
+    db.submit_guest_round_results(round_id, dict(zip(table1, GUEST_T1)), {table1[3]: [table1[0]]})
+
+    db.save_round_results(round_id, dict(zip(table2, ADMIN_T2)), {})
+
+    saved = db.get_round_results(round_id)
+    assert [saved[m] for m in table1] == list(GUEST_T1)  # ゲストの卓1は消えない
+    assert [saved[m] for m in table2] == list(ADMIN_T2)
+    assert db.get_round_tobi_busters(round_id) == {table1[3]: [table1[0]]}
+    meta = db.get_round_result_meta(round_id)
+    assert all(meta[m]["input_source"] == "guest" for m in table1)  # 入力者の記録も残る
+
+
+def test_admin_save_stops_when_the_table_changed_since_the_screen_was_built(two_table_round):
+    round_id, table1, _ = two_table_round
+    seen_when_screen_was_built = {m: None for m in table1}  # 主催者の画面では卓1は未入力だった
+    db.submit_guest_round_results(round_id, dict(zip(table1, GUEST_T1)), {})  # その後ゲストが送信
+
+    with pytest.raises(db.ResultsChangedError):
+        db.save_round_results(
+            round_id, dict(zip(table1, ADMIN_T2)), {},
+            expected_scores=seen_when_screen_was_built, expected_busters={},
+        )
+
+    assert [db.get_round_results(round_id)[m] for m in table1] == list(GUEST_T1)  # 何も書き換わらない
+
+
+def test_admin_save_stops_when_only_tobi_busters_changed(two_table_round):
+    round_id, table1, _ = two_table_round
+    scores = dict(zip(table1, (50000, 45000, 45000, 0)))
+    db.save_round_results(round_id, scores, {})
+    with db.get_connection() as conn:  # 別の主催者が飛び賞だけ直した
+        conn.execute(
+            "INSERT INTO tobi_busters (round_id, busted_member_id, buster_member_id, created_at, input_source) "
+            "VALUES (?, ?, ?, '2026-10-02T10:00:00', 'admin')",
+            (round_id, table1[3], table1[0]),
+        )
+
+    with pytest.raises(db.ResultsChangedError):
+        db.save_round_results(round_id, scores, {}, expected_scores=scores, expected_busters={})
+
+
+def test_admin_save_succeeds_when_nothing_changed_since_the_screen_was_built(two_table_round):
+    round_id, table1, _ = two_table_round
+    before = dict(zip(table1, GUEST_T1))
+    db.submit_guest_round_results(round_id, before, {})
+
+    corrected = {**before, table1[0]: 46000, table1[1]: 34000}
+    db.save_round_results(round_id, corrected, {}, expected_scores=before, expected_busters={})
+
+    assert db.get_round_results(round_id) == corrected
