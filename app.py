@@ -1,3 +1,4 @@
+import logging
 import os
 import secrets
 import smtplib
@@ -11,11 +12,19 @@ import streamlit_authenticator as stauth
 
 import db
 import exports
+import ops_log
 import scoring_logic
 import tournament_service
 from table_logic import position_sort_key
 
 st.set_page_config(page_title="麻雀卓組みアプリ", page_icon="🀄")
+
+# ゲストの成績送信が、入力済み以外の理由(DBのロック待ち切れなど)で失敗したときの案内。
+# 送信は1つのトランザクションなので失敗時は何も保存されていない。もう一度送ればよいことを伝える
+GUEST_SUBMIT_FAILED_MESSAGE = (
+    "保存されていません。少し待ってからもう一度送信してください。"
+    "続く場合は主催者に知らせてください。"
+)
 
 # Streamlitが出力するHTMLシェル(pipパッケージ同梱・このリポジトリでは編集不可。
 # Railwayもデプロイのたびにpip installし直すため、そちら側を直接書き換えても残らない)は
@@ -307,12 +316,30 @@ def render_guest_view(guest_token: str) -> None:
                 if not (sum_ok and confirm):
                     st.error("送信できませんでした。合計と確認のチェックを見直してから、もう一度送信してください。")
                 else:
+                    log_fields = {
+                        "tournament": tournament["id"],
+                        "round": selected_round_number,
+                        "table": selected_table_number,
+                    }
                     try:
                         db.submit_guest_round_results(selected_round_id, raw_scores_input, tobi_busters_input)
+                    except db.ResultsAlreadySubmittedError:
+                        ops_log.log_event("guest_submit_duplicate", logging.WARNING, **log_fields)
+                        st.warning("すでに入力済みです。ページを再読み込みしてください。")
+                    except Exception as exc:
+                        # DBのロック待ち切れ(database is locked)・ディスク不足など。送信は1つの
+                        # トランザクションなので、ここに来たときは1人分も保存されていない。
+                        # 英語のエラー画面ではなく「保存されていない・もう一度送ればよい」ことを伝え、
+                        # 主催者が後から気づけるようにログに残す
+                        ops_log.log_event(
+                            "guest_submit_failed", logging.ERROR, exc_info=True,
+                            **log_fields, error=ops_log.describe_error(exc),
+                        )
+                        st.error(GUEST_SUBMIT_FAILED_MESSAGE)
+                    else:
+                        ops_log.log_event("guest_submit_ok", **log_fields)
                         st.success("送信しました。")
                         st.rerun()
-                    except db.ResultsAlreadySubmittedError:
-                        st.warning("すでに入力済みです。ページを再読み込みしてください。")
 
     st.divider()
     st.write("**大会内順位表**")
@@ -1389,24 +1416,26 @@ for tournament in tournaments:
                 st.caption("卓組みを実行するには、参加メンバーが4人以上必要です。")
             else:
                 col_run, col_reroll = st.columns(2)
-                if col_run.button("次の回戦の卓組みを実行", key=f"run_round_{tournament_id}"):
-                    round_number, absent, tables = tournament_service.run_next_round(tournament)
-                    st.session_state[preview_key] = {
-                        "round_number": round_number,
-                        "absent": absent,
-                        "tables": tables,
-                    }
-                    st.rerun()
-                if st.session_state.get(preview_key) and col_reroll.button(
+                run_clicked = col_run.button("次の回戦の卓組みを実行", key=f"run_round_{tournament_id}")
+                reroll_clicked = bool(st.session_state.get(preview_key)) and col_reroll.button(
                     "作り直す（乱数を引き直す）", key=f"reroll_round_{tournament_id}"
-                ):
-                    round_number, absent, tables = tournament_service.run_next_round(tournament)
-                    st.session_state[preview_key] = {
-                        "round_number": round_number,
-                        "absent": absent,
-                        "tables": tables,
-                    }
-                    st.rerun()
+                )
+                if run_clicked or reroll_clicked:
+                    try:
+                        round_number, absent, tables = tournament_service.run_next_round(tournament)
+                    except Exception as exc:
+                        ops_log.log_event(
+                            "round_run_failed", logging.ERROR, exc_info=True,
+                            tournament=tournament_id, error=ops_log.describe_error(exc),
+                        )
+                        st.error("卓組みを実行できませんでした。少し待ってからもう一度押してください。")
+                    else:
+                        st.session_state[preview_key] = {
+                            "round_number": round_number,
+                            "absent": absent,
+                            "tables": tables,
+                        }
+                        st.rerun()
 
         preview = st.session_state.get(preview_key)
         if preview:
@@ -1429,19 +1458,30 @@ for tournament in tournaments:
                 st.write("抜け番: なし")
 
             if is_admin and st.button("この結果で保存", key=f"save_round_{tournament_id}"):
-                tournament_service.save_confirmed_round(
-                    tournament_id, preview["round_number"], preview["absent"], preview["tables"]
-                )
-                db.record_audit_log(
-                    action="round_save",
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                    username=current_user["username"],
-                    detail=f"tournament_id={tournament_id}, round_number={preview['round_number']}",
-                )
-                st.session_state.pop(preview_key, None)
-                st.success("回戦結果を保存しました。")
-                st.rerun()
+                round_log_fields = {"tournament": tournament_id, "round": preview["round_number"]}
+                try:
+                    tournament_service.save_confirmed_round(
+                        tournament_id, preview["round_number"], preview["absent"], preview["tables"]
+                    )
+                except Exception as exc:
+                    # プレビューは session_state に残っているので、もう一度「この結果で保存」を押せる
+                    ops_log.log_event(
+                        "round_save_failed", logging.ERROR, exc_info=True,
+                        **round_log_fields, error=ops_log.describe_error(exc),
+                    )
+                    st.error("回戦結果を保存できませんでした。少し待ってからもう一度「この結果で保存」を押してください。")
+                else:
+                    ops_log.log_event("round_save_ok", **round_log_fields)
+                    db.record_audit_log(
+                        action="round_save",
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        username=current_user["username"],
+                        detail=f"tournament_id={tournament_id}, round_number={preview['round_number']}",
+                    )
+                    st.session_state.pop(preview_key, None)
+                    st.success("回戦結果を保存しました。")
+                    st.rerun()
 
         st.divider()
 
