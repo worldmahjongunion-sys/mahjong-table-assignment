@@ -1,0 +1,15 @@
+# 箱（イメージ）に入れないもの。
+# 秘密情報と手元のDBは絶対に箱に入れない（イメージを誰かに渡したときに一緒に漏れるため）
+.streamlit/secrets.toml
+.env
+*.db
+*.bak_*
+
+# 箱の中では不要なもの
+.git
+.github
+.pytest_cache
+__pycache__
+*.pyc
+Dockerfile
+.dockerignore
