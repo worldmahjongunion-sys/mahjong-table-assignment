@@ -134,6 +134,8 @@ def test_position_history_and_co_seat_counts_accumulate_for_one_day_method(temp_
 
     position_history = svc.build_position_history(tid)
     # 8人・T=2・R=0で4半荘フル出場なので、全員が東南西北の4方位をちょうど1回ずつ経験
+    # 履歴が空だと下のforが0回で終わって緑のまま通るため、8人全員分あることを先に確かめる
+    assert set(position_history) == set(range(100, 108))
     for positions in position_history.values():
         assert positions == {"東", "南", "西", "北"}
 
