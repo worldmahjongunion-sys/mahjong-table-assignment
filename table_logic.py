@@ -13,6 +13,13 @@ from itertools import combinations
 POSITIONS = ("東", "南", "西", "北")
 _POSITIONS_SET = set(POSITIONS)
 
+# ワンデー4半荘方式の卓分け(_group_into_tables)で試す候補数の上限。
+# 候補数は従来 max(80, 40×卓数) で、1候補あたりの局所探索も卓数の2乗で重くなるため、
+# 計算時間が人数の約3乗で伸びていた(第58課題の計測: 80人4.7秒、120人16秒、200人75秒以上)。
+# 上限を付けても同卓の重複は増えなかった(scripts/compare_restart_cap.py で比較)。
+# None にすると上限なし(従来の挙動)。
+GROUPING_MAX_RESTARTS = 100
+
 
 def position_sort_key(position):
     """席の表示順（東→南→西→北）を返すソートキー。
@@ -287,6 +294,8 @@ def _group_into_tables(labeled_players, co_seat_counts, rng, restarts=None):
         return []
     if restarts is None:
         restarts = max(80, 40 * t)
+        if GROUPING_MAX_RESTARTS is not None:
+            restarts = min(restarts, GROUPING_MAX_RESTARTS)
 
     best_candidate = None
     best_key = None

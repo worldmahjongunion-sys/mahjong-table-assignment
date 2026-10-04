@@ -51,6 +51,38 @@ def _add_user(username, password, **kwargs):
     return db.add_user(username, stauth.Hasher.hash(password), **kwargs)
 
 
+# ---- 起動時のDB準備 ----
+
+def test_init_db_runs_only_once_across_reruns(tmp_path, monkeypatch):
+    """画面を描き直すたびにinit_db()が走らない(同じDBにつき1回だけ)ことを確認する。
+
+    毎回走ると、変更0件でも書き込みロックを取りに行き、ゲストの一斉送信中に
+    画面を開いただけの人まで「database is locked」で失敗する(第58課題)。"""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "init_once.db")
+    monkeypatch.setenv("AUTH_COOKIE_NAME", "test_cookie")
+    monkeypatch.setenv("AUTH_COOKIE_KEY", "test-cookie-key-at-least-32-bytes-long!!")
+    monkeypatch.setenv("AUTH_INVITE_CODE", "correct-horse-battery-staple")
+    calls = []
+    original_init_db = db.init_db
+
+    def counting_init_db():
+        calls.append(1)
+        original_init_db()
+
+    monkeypatch.setattr(db, "init_db", counting_init_db)
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    at.run()
+    at.run()
+    assert not at.exception
+    assert len(calls) == 1
+
+    # 別の画面セッション(別の利用者)が同じDBを開いても、もう一度は走らない
+    AppTest.from_file(APP_PATH).run()
+    assert len(calls) == 1
+
+
 # ---- ログイン ----
 
 def test_correct_login_succeeds_and_records_audit_log(app_env):

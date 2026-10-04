@@ -104,3 +104,44 @@ def test_migration_backfills_tenant_for_legacy_user_and_members(tmp_path, monkey
         "SELECT tenant_id FROM members WHERE name = ?", ("太郎",)
     ).fetchone()[0]
     assert member_tenant_id == user["tenant_id"]
+
+
+def test_init_db_adds_seats_index_to_existing_db_without_losing_rows(tmp_path, monkeypatch):
+    """索引が無い状態で作られた既存DB(本番・stagingの今の状態)に init_db() を実行すると、
+    seats(table_id) の索引が後付けされ、既存の着席データはそのまま読めることを確認する。"""
+    db_path = tmp_path / "pre_seats_index.db"
+    monkeypatch.setattr(db, "DB_PATH", db_path)
+
+    db.init_db()
+    conn = sqlite3.connect(db_path)
+    conn.execute("DROP INDEX idx_seats_table")  # 索引導入前のDBを再現
+    conn.execute("INSERT INTO tenants (name, created_at) VALUES ('t', '2026-01-01T00:00:00')")
+    conn.execute(
+        "INSERT INTO members (tenant_id, name, memo, created_at) VALUES (1, '太郎', '', '2026-01-01T00:00:00')"
+    )
+    conn.execute(
+        "INSERT INTO tournaments (tenant_id, name, kind, table_method, scoring_mode, scoring_config,"
+        " numbering_method, created_at) VALUES (1, 'x', 'ワンデー', '蛇行', 'ポイント', '{}', '受付順',"
+        " '2026-01-01T00:00:00')"
+    )
+    conn.execute("INSERT INTO rounds (tournament_id, round_number, created_at) VALUES (1, 1, '2026-01-01T00:00:00')")
+    conn.execute("INSERT INTO tables (round_id, table_number) VALUES (1, 1)")
+    conn.execute("INSERT INTO seats (table_id, member_id, position) VALUES (1, 1, '東')")
+    conn.commit()
+    conn.close()
+
+    db.init_db()
+    db.init_db()  # 索引が既にあっても例外にならない
+
+    assert db.get_round_seats(1) == [{"table_number": 1, "position": "東", "member_id": 1}]
+    conn = sqlite3.connect(db_path)
+    plan = " ".join(
+        row[3]
+        for row in conn.execute(
+            "EXPLAIN QUERY PLAN SELECT s.member_id FROM seats s JOIN tables t ON t.id = s.table_id"
+            " WHERE t.round_id = ?",
+            (1,),
+        )
+    )
+    conn.close()
+    assert "idx_seats_table" in plan
