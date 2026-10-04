@@ -309,6 +309,10 @@ def init_db() -> None:
             )
             """
         )
+        # get_round_seatsは卓(table_id)から着席を引く。索引が無いとseats全体(他テナントの
+        # 過去大会も含む)を毎回走査し、大会が積み上がるほど全画面が遅くなる(第58課題の計測:
+        # 5000大会で次回戦の卓組み画面が約2.4秒→索引ありで約10ミリ秒)。
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_seats_table ON seats(table_id)")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS absences (
