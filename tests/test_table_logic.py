@@ -337,6 +337,45 @@ def test_one_day_tie_break_rule_prefers_smaller_player_lower_table_index():
     assert result_a == result_b  # 同一シードなら常に同じ候補が選ばれる（決定的）
 
 
+def _count_grouping_candidates(monkeypatch, table_count):
+    """_group_into_tablesが試した候補数(=局所探索の呼び出し回数)を数える。"""
+    calls = []
+    original = tl._local_search
+
+    def counting_local_search(candidate, co_seat_counts, *args, **kwargs):
+        calls.append(1)
+        return original(candidate, co_seat_counts, *args, **kwargs)
+
+    monkeypatch.setattr(tl, "_local_search", counting_local_search)
+    labeled = {
+        table_i * 4 + pos_i + 1: label
+        for table_i in range(table_count)
+        for pos_i, label in enumerate(tl.POSITIONS)
+    }
+    tables = tl._group_into_tables(labeled, {}, random.Random(1))
+    assert_valid_tables(tables, table_count * 4)
+    return len(calls)
+
+
+def test_one_day_grouping_restarts_are_capped_for_large_tournaments(monkeypatch):
+    """卓数が多い大会でも、試す候補数は上限(GROUPING_MAX_RESTARTS)で頭打ちになる。
+
+    上限が無いと候補数が卓数に比例して増え、計算時間が人数の約3乗で伸びる(第58課題)。"""
+    assert _count_grouping_candidates(monkeypatch, 30) == tl.GROUPING_MAX_RESTARTS
+
+
+def test_one_day_grouping_restarts_unchanged_for_small_tournaments(monkeypatch):
+    """上限に届かない小さな大会(1〜2卓)は、従来どおり80候補を試す。"""
+    assert tl.GROUPING_MAX_RESTARTS >= 80
+    assert _count_grouping_candidates(monkeypatch, 2) == 80
+
+
+def test_one_day_grouping_cap_can_be_disabled(monkeypatch):
+    """GROUPING_MAX_RESTARTS=None で上限なし(従来の max(80, 40×卓数))に戻せる。"""
+    monkeypatch.setattr(tl, "GROUPING_MAX_RESTARTS", None)
+    assert _count_grouping_candidates(monkeypatch, 5) == 200
+
+
 def test_one_day_uses_actual_player_numbers_not_array_index():
     """TC-O-10: くじ引きで選手番号が連番でない場合も、選手番号キーで正しく機能する。"""
     members = [7, 13, 22, 31, 45, 58, 60, 71]
