@@ -128,6 +128,63 @@ def compute_rank_points(raw_scores, point_table):
     return _apply_placement_table(raw_scores, point_table)
 
 
+def default_overall_point_table(n):
+    """全員まとめて方式の順位ポイント表の初期値（N人ならN点・N-1点…1点）。"""
+    return list(range(n, 0, -1))
+
+
+def compute_rank_points_overall(raw_scores, point_table):
+    """②ポイント評価（全員まとめて方式）: その回戦の全卓の全員を素点順に並べて順位ポイントを付ける。
+
+    12/19大会向け実装依頼対応。卓ごと方式（compute_rank_points）と違い、全卓の全員の素点を
+    1つにまとめて渡す。N人ならpoint_tableは長さN（初期値はN点〜1点）。
+    素点が同点の人は、卓ごと方式と同じく該当順位のポイントを合算して折半する。
+
+    raw_scores: {選手キー: 素点}（その回戦に出場した全員分）
+    point_table: 1位から順の順位ポイントのリスト（長さはraw_scoresの人数と同じ）
+    """
+    if len(point_table) != len(raw_scores):
+        raise ValueError(
+            f"順位ポイント表の長さ（{len(point_table)}）が人数（{len(raw_scores)}）と一致しません"
+        )
+    return _apply_placement_table(raw_scores, point_table)
+
+
+def final_ranking(final_round_tables, raw_scores):
+    """最終回戦の結果から最終順位を決める（12/19大会向け実装依頼 2.3対応）。
+
+    final_round_tables: 卓番号順の卓のリスト。各卓はその卓の選手キーのリスト。
+    raw_scores: {選手キー: 最終回戦の素点}
+
+    1卓の1位（素点最上位。同点は選手キーの小さい方）が優勝。2位以下は、残りの全員を
+    卓に関係なく最終回戦の素点の高い順に並べる（同点は選手キーの小さい方を上位）。
+    戻り値: 選手キーのリスト（優勝から順）
+    """
+    if not final_round_tables:
+        return []
+    order_key = lambda p: (-raw_scores[p], p)  # noqa: E731
+    champion = sorted(final_round_tables[0], key=order_key)[0]
+    others = [p for table in final_round_tables for p in table if p != champion]
+    return [champion] + sorted(others, key=order_key)
+
+
+def parse_point_table_text(text):
+    """「12,11,10,…」のようなカンマ区切りの順位ポイント表を数値のリストにする。
+
+    全角数字・全角カンマ・読点・空白区切りも受け付ける。空欄なら空リスト（＝N点〜1点を自動）。
+    数値でないものがあればValueError。
+    """
+    normalized = text.translate(str.maketrans("０１２３４５６７８９．－，、", "0123456789.-,,"))
+    parts = [p for p in normalized.replace(" ", ",").replace("　", ",").split(",") if p.strip()]
+    values = []
+    for part in parts:
+        number = float(part)
+        if number != number or number in (float("inf"), float("-inf")):
+            raise ValueError(f"数値ではありません: {part}")
+        values.append(int(number) if number == int(number) else number)
+    return values
+
+
 # ---- 点数の入出力単位（100点単位） ----
 # 画面では点数を「下2桁を省略した100点単位」で入出力する（45,800点は「458」）。
 # DB・計算ロジックは実際の点数のまま持ち、画面の入出力の境界でだけ100倍/100分の1に

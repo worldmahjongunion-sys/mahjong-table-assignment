@@ -142,15 +142,37 @@ def snake_tables(ranked_players):
     return seatings
 
 
-def snake_round(members, appearance_counts, previous_absent, cumulative_scores, rng):
+def ranked_order_tables(ranked_players):
+    """順位リストを蛇行にせず、上から4人ずつ卓1・卓2…に東南西北の順で座らせる。
+
+    12/19大会向け実装依頼 2.2b対応（最終回戦だけ順位順に着席）。
+    8人なら 卓1 = 東1位・南2位・西3位・北4位、卓2 = 東5位・南6位・西7位・北8位。
+    """
+    n = len(ranked_players)
+    if n % 4 != 0:
+        raise ValueError("ranked_players の人数は4の倍数である必要があります")
+    return [
+        dict(zip(POSITIONS, ranked_players[i:i + 4]))
+        for i in range(0, n, 4)
+    ]
+
+
+def snake_round(members, appearance_counts, previous_absent, cumulative_scores, rng, final_round=False):
     """蛇行方式：1回戦分の抜け番選出＋卓組みを行う。
+
+    final_round=True（大会の全回戦数が決まっていて、これが最終回戦）のときは、
+    蛇行にせず累計順位の順に4人ずつ着席させる（ranked_order_tables）。
+    第1回戦（cumulative_scoresがNone）はfinal_roundでもランダムのまま。
 
     戻り値: (抜け番リスト, 卓のリスト)
     """
     _, r = compute_table_count_and_absent(len(members))
     absent, remaining = select_absent_members(members, appearance_counts, previous_absent, r, rng)
     ranked = snake_rank(remaining, cumulative_scores, rng)
-    tables = snake_tables(ranked)
+    if final_round and cumulative_scores is not None:
+        tables = ranked_order_tables(ranked)
+    else:
+        tables = snake_tables(ranked)
     return absent, tables
 
 
