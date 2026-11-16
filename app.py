@@ -88,6 +88,67 @@ def standings_value_column_label(scoring_mode: str) -> str:
     return "総合得点" if scoring_mode == "得点" else "合計ポイント"
 
 
+def render_tournament_format_inputs(key_prefix: str, scoring_mode: str, defaults: dict | None = None,
+                                    member_count: int = 0) -> dict:
+    """全回戦数と、ポイント評価の順位の付け方（卓ごと/全員まとめて）の入力欄（12/19大会向け実装依頼）。
+
+    戻り値はscoring_configに足すキーの辞書。全員まとめての順位ポイント表の書き方が
+    おかしいときは "_error" に画面に出す文言を入れて返す（呼び出し側で保存を止める）。
+    """
+    defaults = defaults or {}
+    result = {}
+    total_rounds = st.number_input(
+        "全回戦数（0なら未設定。設定すると蛇行方式の最終回戦は累計順位の順に着席し、"
+        "最終回戦の結果で最終順位を出します）",
+        min_value=0, step=1, value=int(defaults.get("total_rounds") or 0),
+        key=f"{key_prefix}_total_rounds",
+    )
+    if total_rounds:
+        result["total_rounds"] = int(total_rounds)
+
+    if scoring_mode != "ポイント":
+        return result
+
+    scope_default = defaults.get("rank_scope", tournament_service.RANK_SCOPE_PER_TABLE)
+    rank_scope = st.selectbox(
+        "順位の付け方",
+        tournament_service.RANK_SCOPES,
+        index=tournament_service.RANK_SCOPES.index(scope_default),
+        key=f"{key_prefix}_rank_scope",
+        help="卓ごと: 卓の中で1〜4位を付けます。全員まとめて: その回戦の全卓の全員を素点順に並べ、"
+             "N人ならN点〜1点を付けます（全卓の入力がそろってから計算）。",
+    )
+    result["rank_scope"] = rank_scope
+
+    saved_table = defaults.get("overall_rank_point_table") or []
+    if saved_table:
+        initial_text = ",".join(scoring_logic.format_point_value(v) for v in saved_table)
+    elif member_count:
+        initial_text = ",".join(str(v) for v in scoring_logic.default_overall_point_table(member_count))
+    else:
+        initial_text = ""
+    table_text = st.text_input(
+        "全員まとめての順位ポイント表（1位から、カンマ区切り。空欄なら参加人数Nから N点〜1点 を自動で使います）",
+        value=initial_text,
+        key=f"{key_prefix}_overall_rank_point_table",
+    )
+    try:
+        table = scoring_logic.parse_point_table_text(table_text)
+    except ValueError:
+        result["_error"] = "全員まとめての順位ポイント表は、数字をカンマで区切って入力してください（例: 8,7,6,5,4,3,2,1）。"
+        return result
+    if table and member_count and len(table) != member_count:
+        result["_error"] = (
+            f"全員まとめての順位ポイント表が{len(table)}人分です。参加メンバーは{member_count}人です。"
+            "人数分を入力するか、空欄にしてください。"
+        )
+        return result
+    # 参加人数ぶんの N〜1 と同じなら保存しない（人数が変わっても自動で追従させるため）
+    if table and table != scoring_logic.default_overall_point_table(len(table)):
+        result["overall_rank_point_table"] = table
+    return result
+
+
 def render_scoring_config_inputs(scoring_mode: str, key_prefix: str, defaults: dict | None = None) -> dict:
     """評価方式(得点/ポイント)のパラメータ入力欄を描画し、入力値の辞書を返す。
 
@@ -173,6 +234,30 @@ def render_scoring_config_inputs(scoring_mode: str, key_prefix: str, defaults: d
         f"{key_prefix}_start_point",
     )
     return {"rank_point_table": rank_point_table_input, "start_point": start_point}
+
+
+def render_final_ranking(tournament: dict, member_id_to_name: dict) -> None:
+    """最終順位（全回戦数を設定した大会のみ）。最終回戦の全卓がそろうまでは案内だけ出す。"""
+    total_rounds = tournament_service.get_total_rounds(tournament)
+    if total_rounds is None:
+        return
+    st.write("**最終順位**")
+    final_rows = tournament_service.compute_final_ranking(tournament)
+    if final_rows is None:
+        st.caption(f"第{total_rounds}回戦（最終回戦）の全卓の入力がそろうと表示されます。")
+        return
+    st.caption(f"1卓の1位が優勝。2位以下は第{total_rounds}回戦の素点順です（素点は100点単位）。")
+    st.table(
+        [
+            {
+                "順位": "優勝" if i == 0 else i + 1,
+                "氏名": member_id_to_name.get(row["member_id"], row["member_id"]),
+                f"第{total_rounds}回戦": f"卓{row['table_number']}",
+                "素点": scoring_logic.format_hundreds(row["raw_score"]),
+            }
+            for i, row in enumerate(final_rows)
+        ]
+    )
 
 
 def render_guest_view(guest_token: str) -> None:
@@ -315,6 +400,7 @@ def render_guest_view(guest_token: str) -> None:
                         st.warning("すでに入力済みです。ページを再読み込みしてください。")
 
     st.divider()
+    render_final_ranking(tournament, member_id_to_name)
     st.write("**大会内順位表**")
     if tournament["scoring_mode"] == "得点":
         st.caption("総合得点は100点単位で表示しています（458は45,800点）")
@@ -1193,10 +1279,15 @@ else:
 
         with st.form("new_tournament_form"):
             new_scoring_config = render_scoring_config_inputs(new_scoring_mode, "new_tournament")
+            new_format = render_tournament_format_inputs("new_tournament", new_scoring_mode)
+            new_format_error = new_format.pop("_error", None)
+            new_scoring_config.update(new_format)
             create_submitted = st.form_submit_button("大会を作成")
             if create_submitted:
                 if not new_name.strip():
                     st.error("大会名を入力してください。")
+                elif new_format_error:
+                    st.error(new_format_error)
                 elif scoring_logic.scoring_config_points_out_of_range(new_scoring_config):
                     st.error(scoring_logic.HUNDREDS_OUT_OF_RANGE_MESSAGE)
                 else:
@@ -1277,10 +1368,20 @@ for tournament in tournaments:
                         edit_prefix,
                         defaults=tournament["scoring_config"] if edit_scoring_mode == tournament["scoring_mode"] else None,
                     )
+                    edit_format = render_tournament_format_inputs(
+                        edit_prefix,
+                        edit_scoring_mode,
+                        defaults=tournament["scoring_config"],
+                        member_count=len(db.get_tournament_members(tournament_id)),
+                    )
+                    edit_format_error = edit_format.pop("_error", None)
+                    edit_scoring_config.update(edit_format)
                     edit_submitted = st.form_submit_button("変更を保存")
                     if edit_submitted:
                         if not edit_name.strip():
                             st.error("大会名を入力してください。")
+                        elif edit_format_error:
+                            st.error(edit_format_error)
                         elif scoring_logic.scoring_config_points_out_of_range(edit_scoring_config):
                             st.error(scoring_logic.HUNDREDS_OUT_OF_RANGE_MESSAGE)
                         else:
@@ -1388,6 +1489,24 @@ for tournament in tournaments:
             if len(tournament_members) < 4:
                 st.caption("卓組みを実行するには、参加メンバーが4人以上必要です。")
             else:
+                existing_rounds = db.get_rounds(tournament_id)
+                if (
+                    tournament["table_method"] == "蛇行"
+                    and existing_rounds
+                    and not tournament_service.is_round_complete(existing_rounds[-1]["id"])
+                ):
+                    st.warning(
+                        f"第{existing_rounds[-1]['round_number']}回戦の入力がまだそろっていません。"
+                        "蛇行方式は累計ポイントで席を決めるので、全卓の入力を済ませてから実行してください。"
+                    )
+                total_rounds = tournament_service.get_total_rounds(tournament)
+                if total_rounds is not None and len(existing_rounds) >= total_rounds:
+                    st.info(f"全{total_rounds}回戦を実行済みです。")
+                if tournament_service.overall_point_table_mismatch(tournament):
+                    st.warning(
+                        "全員まとめての順位ポイント表の人数が参加メンバーの人数と合わないため、"
+                        "N点〜1点の初期値で計算しています。大会情報の編集で直してください。"
+                    )
                 col_run, col_reroll = st.columns(2)
                 if col_run.button("次の回戦の卓組みを実行", key=f"run_round_{tournament_id}"):
                     round_number, absent, tables = tournament_service.run_next_round(tournament)
@@ -1414,6 +1533,12 @@ for tournament in tournaments:
                 tm["player_number"]: tm["member_name"] for tm in tournament_members
             }
             st.write(f"第{preview['round_number']}回戦のプレビュー（未保存）")
+            if (
+                tournament["table_method"] == "蛇行"
+                and preview["round_number"] > 1
+                and tournament_service.is_final_round(tournament, preview["round_number"])
+            ):
+                st.caption("最終回戦のため、蛇行にせず累計順位の順に着席します（卓1に1〜4位）。")
             for table_number, table in enumerate(preview["tables"], start=1):
                 seat_line = "　".join(
                     f"{position}: {player_number_to_name.get(player_number, player_number)}"
@@ -1630,6 +1755,8 @@ for tournament in tournaments:
 
             if existing_scores:
                 totals = tournament_service.compute_round_totals(tournament, selected_round_id)
+                if not totals and tournament_service.get_rank_scope(tournament) == tournament_service.RANK_SCOPE_OVERALL:
+                    st.caption("全員まとめて順位を付けるため、全卓の入力がそろうと順位ポイントが出ます。")
                 st.caption(
                     "この回戦の計算結果（"
                     + ("総合得点・100点単位" if tournament["scoring_mode"] == "得点" else "順位ポイント")
@@ -1644,11 +1771,14 @@ for tournament in tournaments:
 
         # ---- 大会内順位表 ----
         if rounds:
+            member_id_to_name_all = {tm["member_id"]: tm["member_name"] for tm in tournament_members}
+            render_final_ranking(tournament, member_id_to_name_all)
             st.write("**大会内順位表**")
             if tournament["scoring_mode"] == "得点":
                 st.caption("総合得点は100点単位で表示しています（458は45,800点）")
+            if tournament_service.get_rank_scope(tournament) == tournament_service.RANK_SCOPE_OVERALL:
+                st.caption("順位ポイントは回戦ごとに全員まとめて付けます。全卓の入力がそろっていない回戦は、まだ足していません。")
             standings = tournament_service.compute_standings(tournament)
-            member_id_to_name_all = {tm["member_id"]: tm["member_name"] for tm in tournament_members}
             st.table(
                 [
                     {
