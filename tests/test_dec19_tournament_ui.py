@@ -179,3 +179,44 @@ def test_warns_before_next_snake_round_when_previous_round_incomplete(app_env):
     _login(at, "admin1", "adminpass123")
     assert not at.exception
     assert any("入力がまだそろっていません" in w.value for w in at.warning)
+
+
+def test_first_round_preview_in_player_number_order_without_reroll(app_env):
+    # 全回戦数を設定した蛇行の大会: 第1回戦は選手番号順。結果が変わらないので「作り直す」は出さない
+    user_id, tenant_id, tournament_id = _setup_admin_with_point_tournament(n=8, config=OVERALL_CONFIG)
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+    at.button[_find_button(at, "次の回戦の卓組みを実行")].click().run()
+    assert not at.exception
+    assert any("選手番号（受付順）の順に着席" in c.value for c in at.caption)
+    assert not any("作り直す" in b.label for b in at.button)
+    texts = [m.value for m in at.markdown]
+    assert any(t.startswith("卓1: 東: 選手1") and "北: 選手4" in t for t in texts)
+    assert any(t.startswith("卓2: 東: 選手5") and "北: 選手8" in t for t in texts)
+
+
+def test_first_round_without_total_rounds_keeps_reroll(app_env):
+    config = {k: v for k, v in OVERALL_CONFIG.items() if k != "total_rounds"}
+    user_id, tenant_id, tournament_id = _setup_admin_with_point_tournament(n=8, config=config)
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+    at.button[_find_button(at, "次の回戦の卓組みを実行")].click().run()
+    assert not at.exception
+    assert any("作り直す" in b.label for b in at.button)
+    assert not any("選手番号（受付順）の順に着席" in c.value for c in at.caption)
+
+
+def test_second_round_preview_has_no_reroll(app_env):
+    user_id, tenant_id, tournament_id = _setup_admin_with_point_tournament(n=8, config=OVERALL_CONFIG)
+    _play_rounds(tenant_id, tournament_id, 1, random.Random(3))
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+    at.button[_find_button(at, "次の回戦の卓組みを実行")].click().run()
+    assert not at.exception
+    assert not any("作り直す" in b.label for b in at.button)

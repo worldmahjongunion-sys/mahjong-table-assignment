@@ -157,17 +157,25 @@ def ranked_order_tables(ranked_players):
     ]
 
 
-def snake_round(members, appearance_counts, previous_absent, cumulative_scores, rng, final_round=False):
+def snake_round(members, appearance_counts, previous_absent, cumulative_scores, rng, final_round=False,
+                ordered_first_round=False):
     """蛇行方式：1回戦分の抜け番選出＋卓組みを行う。
 
     final_round=True（大会の全回戦数が決まっていて、これが最終回戦）のときは、
     蛇行にせず累計順位の順に4人ずつ着席させる（ranked_order_tables）。
-    第1回戦（cumulative_scoresがNone）はfinal_roundでもランダムのまま。
+    第1回戦（cumulative_scoresがNone）はfinal_roundでもこの扱いにしない。
+
+    ordered_first_round=True（大会の全回戦数が決まっている）のときは、第1回戦を
+    ランダムにせず選手番号（受付順）の順に4人ずつ着席させる（12/19大会向け、2026-11-18）。
+    8人なら 卓1 = 東1番・南2番・西3番・北4番、卓2 = 東5番〜北8番。
+    抜け番が出る人数のときは、抜け番の選び方（4.1）だけはこれまでどおり。
 
     戻り値: (抜け番リスト, 卓のリスト)
     """
     _, r = compute_table_count_and_absent(len(members))
     absent, remaining = select_absent_members(members, appearance_counts, previous_absent, r, rng)
+    if cumulative_scores is None and ordered_first_round:
+        return absent, ranked_order_tables(sorted(remaining))
     ranked = snake_rank(remaining, cumulative_scores, rng)
     if final_round and cumulative_scores is not None:
         tables = ranked_order_tables(ranked)

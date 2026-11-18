@@ -1521,7 +1521,9 @@ for tournament in tournaments:
                         "tables": tables,
                     }
                     st.rerun()
-                if st.session_state.get(preview_key) and col_reroll.button(
+                if st.session_state.get(preview_key) and not tournament_service.next_round_is_fixed(
+                    tournament, len(tournament_members)
+                ) and col_reroll.button(
                     "作り直す（乱数を引き直す）", key=f"reroll_round_{tournament_id}"
                 ):
                     round_number, absent, tables = tournament_service.run_next_round(tournament)
@@ -1544,6 +1546,12 @@ for tournament in tournaments:
                 and tournament_service.is_final_round(tournament, preview["round_number"])
             ):
                 st.caption("最終回戦のため、蛇行にせず累計順位の順に着席します（卓1に1〜4位）。")
+            if (
+                tournament["table_method"] == "蛇行"
+                and preview["round_number"] == 1
+                and tournament_service.get_total_rounds(tournament) is not None
+            ):
+                st.caption("第1回戦は、選手番号（受付順）の順に着席します（卓1に1〜4番）。")
             for table_number, table in enumerate(preview["tables"], start=1):
                 seat_line = "　".join(
                     f"{position}: {player_number_to_name.get(player_number, player_number)}"
