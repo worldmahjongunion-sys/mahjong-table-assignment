@@ -177,9 +177,9 @@ def temp_db(tmp_path, monkeypatch):
     return db_path
 
 
-def _setup(n, scoring_config):
-    uid = db.add_user("owner", "hash")
-    tenant_id = db.get_user_by_username("owner")["tenant_id"]
+def _setup(n, scoring_config, username="owner"):
+    uid = db.add_user(username, "hash")
+    tenant_id = db.get_user_by_username(username)["tenant_id"]
     member_ids = [db.add_member(tenant_id, uid, f"M{i}", "") for i in range(n)]
     tid = db.create_tournament(
         tenant_id, "12/19大会", "ワンデー", "蛇行", "ポイント", scoring_config, "受付順"
@@ -288,6 +288,8 @@ def test_five_hanchan_simulation(temp_db, n, seed):
         round_id = svc.save_confirmed_round(tid, rn, absent, tables)
         seats = _seats_by_number(tid, round_id)
 
+        if round_number == 1:
+            assert seats == table_logic.ranked_order_tables(list(range(1, n + 1))), "第1回戦は選手番号順"
         if round_number >= 2:
             ranked = sorted(range(1, n + 1), key=lambda pn: (-cumulative.get(pn, 0), pn))
             if round_number == 5:
@@ -393,8 +395,9 @@ def test_final_ranking_champion_tie_decided_by_cumulative_points(temp_db):
     rn, absent, tables = svc.run_next_round(tournament, random.Random(5))
     round_id = svc.save_confirmed_round(tid, rn, absent, tables)
     scores = {}
+    # 第1回戦は選手番号順（卓1=1〜4、卓2=5〜8）。卓2を高くして、累計1位=5番・2位=1番にする
     for table, table_scores in zip(_seats_by_number(tid, round_id),
-                                   [[45000, 35000, 15000, 5000], [40000, 30000, 20000, 10000]]):
+                                   [[40000, 30000, 20000, 10000], [45000, 35000, 15000, 5000]]):
         for pn, s in zip(table.values(), table_scores):
             scores[to_member[pn]] = s
     db.save_round_results(round_id, scores, {})
@@ -416,3 +419,80 @@ def test_final_ranking_champion_tie_decided_by_cumulative_points(temp_db):
     assert final[0]["player_number"] == east
     assert final[1]["player_number"] == seats[1]["東"]  # 卓2の40000
     assert final[2]["player_number"] == south
+
+
+# ---------------------------------------------------------------------------
+# 第1回戦の選手番号順（全回戦数を設定した蛇行の大会、2026-11-18 追加依頼）
+# ---------------------------------------------------------------------------
+
+def test_snake_round_ordered_first_round_8_and_12():
+    for seed in (1, 2, 3):
+        rng = random.Random(seed)
+        members = [5, 3, 8, 1, 7, 2, 6, 4]  # 渡す順に関係なく選手番号順
+        absent, tables = table_logic.snake_round(members, {}, set(), None, rng, ordered_first_round=True)
+        assert absent == []
+        assert tables == [
+            {"東": 1, "南": 2, "西": 3, "北": 4},
+            {"東": 5, "南": 6, "西": 7, "北": 8},
+        ]
+        absent, tables = table_logic.snake_round(
+            list(range(12, 0, -1)), {}, set(), None, rng, ordered_first_round=True
+        )
+        assert tables[2] == {"東": 9, "南": 10, "西": 11, "北": 12}
+        assert tables[0] == {"東": 1, "南": 2, "西": 3, "北": 4}
+
+
+def test_snake_round_ordered_first_round_with_absent_sorts_the_rest():
+    absent, tables = table_logic.snake_round(
+        list(range(1, 10)), {}, set(), None, random.Random(4), ordered_first_round=True
+    )
+    assert len(absent) == 1
+    seated = [pn for pn in range(1, 10) if pn not in absent]
+    assert tables == table_logic.ranked_order_tables(seated)
+
+
+def test_snake_round_without_ordered_first_round_is_still_random():
+    results = {
+        tuple(tuple(t.values()) for t in table_logic.snake_round(
+            list(range(1, 9)), {}, set(), None, random.Random(seed))[1])
+        for seed in range(10)
+    }
+    assert len(results) > 1
+
+
+def test_service_first_round_order_depends_on_total_rounds(temp_db):
+    tenant_id, tid = _setup(8, OVERALL_CONFIG)
+    tournament = db.get_tournament(tenant_id, tid)
+    for seed in (1, 9):
+        _, _, tables = svc.run_next_round(tournament, random.Random(seed))
+        assert tables == table_logic.ranked_order_tables(list(range(1, 9)))
+
+    config = {k: v for k, v in OVERALL_CONFIG.items() if k != "total_rounds"}
+    tenant_id2, tid2 = _setup(8, config, username="admin2")
+    tournament2 = db.get_tournament(tenant_id2, tid2)
+    results = {
+        tuple(tuple(t.values()) for t in svc.run_next_round(tournament2, random.Random(seed))[2])
+        for seed in range(10)
+    }
+    assert len(results) > 1  # 全回戦数なしの大会は従来どおりランダム
+
+
+def test_next_round_is_fixed(temp_db):
+    tenant_id, tid = _setup(8, OVERALL_CONFIG)
+    tournament = db.get_tournament(tenant_id, tid)
+    assert svc.next_round_is_fixed(tournament, 8)  # 第1回戦・全回戦数あり
+    assert not svc.next_round_is_fixed(tournament, 9)  # 抜け番が出る人数
+    rn, absent, tables = svc.run_next_round(tournament, random.Random(1))
+    svc.save_confirmed_round(tid, rn, absent, tables)
+    assert svc.next_round_is_fixed(tournament, 8)  # 第2回戦以降
+
+    config = {k: v for k, v in OVERALL_CONFIG.items() if k != "total_rounds"}
+    tenant_id2, tid2 = _setup(8, config, username="admin2")
+    tournament2 = db.get_tournament(tenant_id2, tid2)
+    assert not svc.next_round_is_fixed(tournament2, 8)  # 全回戦数なしの第1回戦はランダム
+    rn, absent, tables = svc.run_next_round(tournament2, random.Random(1))
+    svc.save_confirmed_round(tid2, rn, absent, tables)
+    assert svc.next_round_is_fixed(tournament2, 8)  # 第2回戦以降の蛇行は決まった並び
+
+    tournament2 = dict(tournament2, table_method="ワンデー")
+    assert not svc.next_round_is_fixed(tournament2, 8)

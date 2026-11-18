@@ -221,6 +221,22 @@ def is_final_round(tournament, round_number):
     return total_rounds is not None and round_number == total_rounds
 
 
+def next_round_is_fixed(tournament, member_count):
+    """次の回戦の卓組みが乱数で変わらないか（「作り直す」ボタンを出さないための判定）。
+
+    蛇行方式で、抜け番が出ない人数（4の倍数）のときに、
+    - 第2回戦以降（累計順の蛇行・最終回戦の順位順はどちらも決まった並び）
+    - 全回戦数を設定した大会の第1回戦（選手番号順）
+    はやり直しても同じ結果になる。ワンデー方式・抜け番が出る人数・
+    全回戦数なしの第1回戦は乱数を使うのでFalse。
+    """
+    if tournament["table_method"] != "蛇行" or member_count % 4 != 0:
+        return False
+    if db.count_rounds(tournament["id"]) >= 1:
+        return True
+    return get_total_rounds(tournament) is not None
+
+
 def run_next_round(tournament, rng=None):
     """次回戦の卓組みをその場で実行する（DB未保存、プレビュー用）。
 
@@ -241,6 +257,7 @@ def run_next_round(tournament, rng=None):
         absent, tables = table_logic.snake_round(
             player_numbers, appearance_counts, previous_absent, cumulative_scores, rng,
             final_round=is_final_round(tournament, round_number),
+            ordered_first_round=get_total_rounds(tournament) is not None,
         )
     else:
         position_history = build_position_history(tournament_id)
