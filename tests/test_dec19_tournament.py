@@ -3,7 +3,8 @@
 - 全員まとめて順位ポイント（8名なら8〜1点、12名なら12〜1点、同点は折半）
 - 第2〜4半荘の蛇行配置、第5半荘（最終回戦）の順位順着席
 - 一部の卓だけ入力済みの回戦は累計に寄与しない
-- 5半荘通しのシミュレーションと最終順位（1卓1位が優勝、2位以下は最終回戦の素点順）
+- 5半荘通しのシミュレーションと最終順位（1卓1位が優勝、2位以下は最終回戦の素点順。
+  素点が同点なら累計順位ポイント→素点合計→選手番号）
 """
 import random
 
@@ -72,6 +73,47 @@ def test_final_ranking_table1_tie_uses_player_number():
     tables = [[3, 1, 2, 4], [5, 6, 7, 8]]
     raw = {1: 40000, 3: 40000, 2: 20000, 4: 20000, 5: 35000, 6: 35000, 7: 15000, 8: 15000}
     assert scoring_logic.final_ranking(tables, raw)[0] == 1
+
+
+# 最終回戦の素点の同点処理（2026-11-18 追加依頼）:
+#   累計順位ポイントが多い方 → 素点合計が多い方 → 選手番号の若い方
+# 卓1: 1,2,3,4 / 卓2: 5,6,7,8。1と2（優勝争い）、5と6、7と8、3と4がそれぞれ最終回戦の素点で同点。
+TIE_TABLES = [[1, 2, 3, 4], [5, 6, 7, 8]]
+TIE_RAW = {1: 40000, 2: 40000, 3: 10000, 4: 10000, 5: 30000, 6: 30000, 7: 20000, 8: 20000}
+
+
+@pytest.mark.parametrize(
+    "case,points,raw_sums,expected",
+    [
+        # ① 累計順位ポイントで決まる（素点合計は逆の順にして、ポイントが先に効くことを確かめる）
+        ("累計ポイント",
+         {1: 20, 2: 30, 3: 1, 4: 2, 5: 10, 6: 15, 7: 5, 8: 12},
+         {1: 200000, 2: 100000, 3: 90000, 4: 80000, 5: 150000, 6: 140000, 7: 130000, 8: 120000},
+         [2, 1, 6, 5, 8, 7, 4, 3]),
+        # ② 累計ポイントも同点 → 素点合計で決まる（選手番号とは逆の順）
+        ("素点合計",
+         {1: 20, 2: 20, 3: 5, 4: 5, 5: 10, 6: 10, 7: 8, 8: 8},
+         {1: 100000, 2: 120000, 3: 50000, 4: 60000, 5: 110000, 6: 115000, 7: 90000, 8: 95000},
+         [2, 1, 6, 5, 8, 7, 4, 3]),
+        # ③ 累計ポイントも素点合計も同点 → 選手番号の若い方
+        ("選手番号",
+         {1: 20, 2: 20, 3: 5, 4: 5, 5: 10, 6: 10, 7: 8, 8: 8},
+         {1: 100000, 2: 100000, 3: 50000, 4: 50000, 5: 110000, 6: 110000, 7: 90000, 8: 90000},
+         [1, 2, 5, 6, 7, 8, 3, 4]),
+    ],
+)
+def test_final_ranking_tie_break(case, points, raw_sums, expected):
+    order = scoring_logic.final_ranking(TIE_TABLES, TIE_RAW, points, raw_sums)
+    assert order == expected, case
+
+
+def test_final_ranking_tie_break_does_not_override_raw_score():
+    # 最終回戦の素点が違えば、累計ポイント・素点合計がどれだけ多くても素点の順
+    tables = [[1, 2, 3, 4], [5, 6, 7, 8]]
+    raw = {1: 40000, 2: 39900, 3: 10100, 4: 10000, 5: 30000, 6: 29900, 7: 20100, 8: 20000}
+    points = {pn: 100 * pn for pn in range(1, 9)}
+    sums = {pn: 100000 * pn for pn in range(1, 9)}
+    assert scoring_logic.final_ranking(tables, raw, points, sums) == [1, 2, 5, 6, 7, 8, 3, 4]
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +279,7 @@ def test_five_hanchan_simulation(temp_db, n, seed):
     rng = random.Random(seed)
     to_member = _number_to_member(tid)
     cumulative = {}
+    raw_sums = {}
 
     for round_number in range(1, 6):
         tournament = db.get_tournament(tenant_id, tid)
@@ -264,6 +307,8 @@ def test_five_hanchan_simulation(temp_db, n, seed):
         # 入力済みの回戦の累計は、テスト側で独立に計算した値と一致する
         for pn, v in _expected_overall_points(scores_by_number).items():
             cumulative[pn] = cumulative.get(pn, 0) + v
+        for pn, score in scores_by_number.items():
+            raw_sums[pn] = raw_sums.get(pn, 0) + score
         tournament = db.get_tournament(tenant_id, tid)
         assert svc.build_cumulative_scores(tournament) == pytest.approx(cumulative)
 
@@ -273,9 +318,10 @@ def test_five_hanchan_simulation(temp_db, n, seed):
         else:
             final_order = [row["player_number"] for row in final]
             table1 = list(seats[0].values())
-            champion = sorted(table1, key=lambda pn: (-scores_by_number[pn], pn))[0]
-            rest = sorted((pn for pn in scores_by_number if pn != champion),
-                          key=lambda pn: (-scores_by_number[pn], pn))
+            def tie_key(pn):
+                return (-scores_by_number[pn], -cumulative[pn], -raw_sums[pn], pn)
+            champion = sorted(table1, key=tie_key)[0]
+            rest = sorted((pn for pn in scores_by_number if pn != champion), key=tie_key)
             assert final_order == [champion] + rest
             assert final[0]["table_number"] == 1
             assert len(final) == n
@@ -335,3 +381,38 @@ def test_per_table_tournament_with_total_rounds_seats_final_round_in_rank_order(
     _, _, tables2 = svc.run_next_round(tournament, rng)
     ranked = sorted(range(1, 9), key=lambda pn: (-cumulative[pn], pn))
     assert tables2 == table_logic.ranked_order_tables(ranked)
+
+
+def test_final_ranking_champion_tie_decided_by_cumulative_points(temp_db):
+    # 2半荘の大会。第2回戦（最終回戦）の1卓で東（累計1位）と南（累計2位）が素点同点 →
+    # 累計順位ポイントの多い東が優勝（選手番号の大小に関係なく）
+    config = dict(OVERALL_CONFIG, total_rounds=2)
+    tenant_id, tid = _setup(8, config)
+    to_member = _number_to_member(tid)
+    tournament = db.get_tournament(tenant_id, tid)
+    rn, absent, tables = svc.run_next_round(tournament, random.Random(5))
+    round_id = svc.save_confirmed_round(tid, rn, absent, tables)
+    scores = {}
+    for table, table_scores in zip(_seats_by_number(tid, round_id),
+                                   [[45000, 35000, 15000, 5000], [40000, 30000, 20000, 10000]]):
+        for pn, s in zip(table.values(), table_scores):
+            scores[to_member[pn]] = s
+    db.save_round_results(round_id, scores, {})
+
+    tournament = db.get_tournament(tenant_id, tid)
+    rn, absent, tables = svc.run_next_round(tournament, random.Random(5))
+    round_id = svc.save_confirmed_round(tid, rn, absent, tables)
+    seats = _seats_by_number(tid, round_id)
+    scores = {}
+    for table, table_scores in zip(seats, [[30000, 30000, 25000, 15000], [40000, 30000, 20000, 10000]]):
+        for pos, s in zip(["東", "南", "西", "北"], table_scores):
+            scores[to_member[table[pos]]] = s
+    db.save_round_results(round_id, scores, {})
+
+    tournament = db.get_tournament(tenant_id, tid)
+    final = svc.compute_final_ranking(tournament)
+    east, south = seats[0]["東"], seats[0]["南"]
+    assert east > south  # 選手番号だけで決めると南が優勝になる並びであること
+    assert final[0]["player_number"] == east
+    assert final[1]["player_number"] == seats[1]["東"]  # 卓2の40000
+    assert final[2]["player_number"] == south

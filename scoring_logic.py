@@ -150,19 +150,28 @@ def compute_rank_points_overall(raw_scores, point_table):
     return _apply_placement_table(raw_scores, point_table)
 
 
-def final_ranking(final_round_tables, raw_scores):
+def final_ranking(final_round_tables, raw_scores, cumulative_points=None, raw_score_sums=None):
     """最終回戦の結果から最終順位を決める（12/19大会向け実装依頼 2.3対応）。
 
     final_round_tables: 卓番号順の卓のリスト。各卓はその卓の選手キーのリスト。
     raw_scores: {選手キー: 最終回戦の素点}
+    cumulative_points: {選手キー: 全回戦の累計順位ポイント}（同点処理の1段目。省略時は全員0）
+    raw_score_sums: {選手キー: 全回戦の素点合計}（同点処理の2段目。省略時は全員0）
 
-    1卓の1位（素点最上位。同点は選手キーの小さい方）が優勝。2位以下は、残りの全員を
-    卓に関係なく最終回戦の素点の高い順に並べる（同点は選手キーの小さい方を上位）。
+    1卓の1位（素点最上位）が優勝。2位以下は、残りの全員を卓に関係なく最終回戦の素点の
+    高い順に並べる。最終回戦の素点が同点のときは（優勝・2位以下とも）、
+    全回戦の累計順位ポイントが多い方 → 全回戦の素点合計が多い方 → 選手キー（選手番号）の
+    小さい方 の順で上位にする（2026-11-18 追加依頼）。
     戻り値: 選手キーのリスト（優勝から順）
     """
     if not final_round_tables:
         return []
-    order_key = lambda p: (-raw_scores[p], p)  # noqa: E731
+    cumulative_points = cumulative_points or {}
+    raw_score_sums = raw_score_sums or {}
+
+    def order_key(p):
+        return (-raw_scores[p], -cumulative_points.get(p, 0), -raw_score_sums.get(p, 0), p)
+
     champion = sorted(final_round_tables[0], key=order_key)[0]
     others = [p for table in final_round_tables for p in table if p != champion]
     return [champion] + sorted(others, key=order_key)

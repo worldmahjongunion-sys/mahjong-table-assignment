@@ -292,7 +292,9 @@ def compute_final_ranking(tournament):
 
     全回戦数が設定されていて、その最終回戦の全卓の素点がそろっているときだけ返す。
     それ以外（未設定・最終回戦がまだ・入力途中）はNone。
-    1卓の1位が優勝、2位以下は最終回戦の全員の素点順（同点は選手番号の若い方が上位）。
+    1卓の1位が優勝、2位以下は最終回戦の全員の素点順。最終回戦の素点が同点のときは
+    全回戦の累計（順位ポイント方式なら累計順位ポイント、得点方式なら累計得点）→
+    全回戦の素点合計（ウマ・オカ抜き）→ 選手番号の若い方 の順で上位にする。
 
     戻り値: [{"member_id", "player_number", "table_number", "raw_score"}, ...]（優勝から順）
     """
@@ -311,7 +313,10 @@ def compute_final_ranking(tournament):
     table_of = {member_to_number[mid]: tn for tn, mids in tables for mid in mids}
     scores_by_number = {member_to_number[mid]: raw_scores[mid] for _, mids in tables for mid in mids}
     ordered = scoring_logic.final_ranking(
-        [[member_to_number[mid] for mid in mids] for _, mids in tables], scores_by_number
+        [[member_to_number[mid] for mid in mids] for _, mids in tables],
+        scores_by_number,
+        cumulative_points=build_cumulative_scores(tournament),
+        raw_score_sums=_cumulative_raw_score_sum(tournament["id"]),
     )
     return [
         {

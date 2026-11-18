@@ -246,7 +246,12 @@ def render_final_ranking(tournament: dict, member_id_to_name: dict) -> None:
     if final_rows is None:
         st.caption(f"第{total_rounds}回戦（最終回戦）の全卓の入力がそろうと表示されます。")
         return
-    st.caption(f"1卓の1位が優勝。2位以下は第{total_rounds}回戦の素点順です（素点は100点単位）。")
+    cumulative_label = "累計得点" if tournament["scoring_mode"] == "得点" else "累計ポイント"
+    st.caption(
+        f"1卓の1位が優勝。2位以下は第{total_rounds}回戦の素点順です（素点は100点単位）。"
+        f"第{total_rounds}回戦の素点が同点のときは、全{total_rounds}回戦の{cumulative_label}が多い方 → "
+        f"全{total_rounds}回戦の素点合計が多い方 → 選手番号の若い方 の順で上位にします。"
+    )
     st.table(
         [
             {

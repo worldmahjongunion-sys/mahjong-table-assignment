@@ -139,6 +139,8 @@ def test_admin_and_guest_see_final_ranking_after_final_round(app_env):
     assert not guest.exception
     guest_final = next(t for t in guest.table if "素点" in t.value.columns)
     assert guest_final.value.iloc[0]["氏名"] == champion_name
+    assert any("選手番号の若い方 の順で上位" in c.value for c in guest.caption)
+    assert any("累計ポイントが多い方" in c.value for c in at.caption)
 
 
 def test_final_ranking_waits_until_final_round_is_complete(app_env):
