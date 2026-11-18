@@ -236,6 +236,12 @@ def render_scoring_config_inputs(scoring_mode: str, key_prefix: str, defaults: d
     return {"rank_point_table": rank_point_table_input, "start_point": start_point}
 
 
+def render_standings_tie_note(tournament: dict) -> None:
+    """大会内順位表の下の1行。ポイント方式は同点の並べ方が席決めと違うので、そのことを書いておく。"""
+    if tournament["scoring_mode"] == "ポイント":
+        st.caption("累計が同点のときは、素点合計の多い方 → 選手番号の若い方 の順で上にしています（席決めは選手番号の若い順）。")
+
+
 def render_final_ranking(tournament: dict, member_id_to_name: dict) -> None:
     """最終順位（全回戦数を設定した大会のみ）。最終回戦の全卓がそろうまでは案内だけ出す。"""
     total_rounds = tournament_service.get_total_rounds(tournament)
@@ -427,6 +433,7 @@ def render_guest_view(guest_token: str) -> None:
                 for i, row in enumerate(standings)
             ]
         )
+        render_standings_tie_note(tournament)
 
 
 def get_auth_setting(env_var: str, secrets_key: str) -> str:
@@ -1578,6 +1585,10 @@ for tournament in tournaments:
                     detail=f"tournament_id={tournament_id}, round_number={preview['round_number']}",
                 )
                 st.session_state.pop(preview_key, None)
+                # 保存した新しい回戦を、下の成績入力の「回戦を選択」で選んだ状態にする
+                # （この時点ではselectboxはまだ作られていないので、キーを消してよい）
+                st.session_state[f"score_round_choice_{tournament_id}"] = preview["round_number"]
+                st.session_state.pop(f"score_round_select_{tournament_id}", None)
                 st.success("回戦結果を保存しました。")
                 st.rerun()
 
@@ -1590,10 +1601,24 @@ for tournament in tournaments:
             st.caption("まだ回戦がありません。")
         else:
             round_options = {r["round_number"]: r["id"] for r in rounds}
+            # 上の「次の回戦の卓組みを実行」「作り直す」「この結果で保存」は st.rerun() で
+            # 実行を打ち切るため、その回はこのselectboxまで届かない。Streamlitは打ち切られた回に
+            # 出てこなかった入力欄の値を捨てるので、次の表示でselectboxが第1回戦に戻るのに、
+            # ブラウザの見た目は前の選択（例: 3）のまま残り、第1回戦の成績を上書きするおそれがあった。
+            # そこで選んだ回戦を入力欄とは別のキー（score_round_choice_）にも覚えておき、
+            # 値が捨てられていたら覚えておいた回戦で作り直す（2026-11-18 staging 確認で発見）。
+            round_select_key = f"score_round_select_{tournament_id}"
+            round_choice_key = f"score_round_choice_{tournament_id}"
+            if round_select_key not in st.session_state:
+                remembered = st.session_state.get(round_choice_key)
+                if remembered in round_options:
+                    st.session_state[round_select_key] = remembered
             selected_round_number = st.selectbox(
-                "回戦を選択", options=list(round_options.keys()), key=f"score_round_select_{tournament_id}"
+                "回戦を選択", options=list(round_options.keys()), key=round_select_key
             )
+            st.session_state[round_choice_key] = selected_round_number
             selected_round_id = round_options[selected_round_number]
+            st.write(f"**第{selected_round_number}回戦の成績入力**")
             seats = db.get_round_seats(selected_round_id)
             existing_scores = db.get_round_results(selected_round_id)
             existing_busters = db.get_round_tobi_busters(selected_round_id)
@@ -1718,7 +1743,7 @@ for tournament in tournaments:
                                 f"{scoring_logic.format_hundreds(expected_total)}になるよう確認してください。"
                             )
 
-            if is_admin and st.button("成績を保存", key=f"save_results_{selected_round_id}"):
+            if is_admin and st.button(f"第{selected_round_number}回戦の成績を保存", key=f"save_results_{selected_round_id}"):
                 # 依頼書3.5: 主催者の保存(修正を含む)にも、ゲスト入力と同じ「卓ごとの素点合計＝
                 # 開始点数×4」のチェックをかける。ずれている卓は上で赤字表示済みなので、ここでは
                 # 保存を止めるだけにする。
@@ -1805,6 +1830,7 @@ for tournament in tournaments:
                     for i, row in enumerate(standings)
                 ]
             )
+            render_standings_tie_note(tournament)
 
         st.divider()
 

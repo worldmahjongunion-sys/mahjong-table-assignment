@@ -11,7 +11,7 @@ from streamlit.testing.v1 import AppTest
 import db
 import scoring_logic
 import tournament_service as svc
-from test_tournament_ui import APP_PATH, _add_user, _find_button, _login, app_env  # noqa: F401
+from test_tournament_ui import APP_PATH, SCORE_CONFIG, _add_user, _find_button, _login, app_env  # noqa: F401
 
 OVERALL_CONFIG = {
     "rank_point_table": [3, 1, -1, -3],
@@ -220,3 +220,93 @@ def test_second_round_preview_has_no_reroll(app_env):
     at.button[_find_button(at, "次の回戦の卓組みを実行")].click().run()
     assert not at.exception
     assert not any("作り直す" in b.label for b in at.button)
+
+
+# ---------------------------------------------------------------------------
+# 成績入力の「回戦を選択」（2026-11-18 staging 確認で発見）
+# 「次の回戦の卓組みを実行」などの st.rerun() のあとに、表示は第3回戦のまま
+# 入力欄が第1回戦に戻っていた。
+# ---------------------------------------------------------------------------
+
+def _score_labels(at):
+    """成績入力の入力欄の見出し（「氏名（東）」…）を画面の順に返す。"""
+    return [ni.label for ni in at.number_input if ni.label.endswith(("（東）", "（南）", "（西）", "（北）"))]
+
+
+def _expected_labels(tournament_id, round_number):
+    names = {m["member_id"]: m["member_name"] for m in db.get_tournament_members(tournament_id)}
+    round_row = next(r for r in db.get_rounds(tournament_id) if r["round_number"] == round_number)
+    seats = sorted(db.get_round_seats(round_row["id"]),
+                   key=lambda s: (s["table_number"], "東南西北".index(s["position"])))
+    return [f"{names[s['member_id']]}（{s['position']}）" for s in seats]
+
+
+def _round_select(at, tournament_id):
+    return at.selectbox(key=f"score_round_select_{tournament_id}")
+
+
+def test_round_select_keeps_choice_after_running_next_round(app_env):
+    config = dict(OVERALL_CONFIG, total_rounds=5)
+    user_id, tenant_id, tournament_id = _setup_admin_with_point_tournament(n=8, config=config)
+    _play_rounds(tenant_id, tournament_id, 3, random.Random(3))
+    assert _expected_labels(tournament_id, 3) != _expected_labels(tournament_id, 1)
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+    _round_select(at, tournament_id).set_value(3).run()
+    assert _score_labels(at) == _expected_labels(tournament_id, 3)
+
+    at.button[_find_button(at, "次の回戦の卓組みを実行")].click().run()
+    assert not at.exception
+    assert _round_select(at, tournament_id).value == 3
+    assert _score_labels(at) == _expected_labels(tournament_id, 3)
+    assert any(m.value == "**第3回戦の成績入力**" for m in at.markdown)
+    assert any(b.label == "第3回戦の成績を保存" for b in at.button)
+
+
+def test_saving_new_round_switches_score_entry_to_it(app_env):
+    config = dict(OVERALL_CONFIG, total_rounds=5)
+    user_id, tenant_id, tournament_id = _setup_admin_with_point_tournament(n=8, config=config)
+    _play_rounds(tenant_id, tournament_id, 2, random.Random(3))
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+    assert _round_select(at, tournament_id).value == 1  # 最初は第1回戦（これまでどおり）
+    at.button[_find_button(at, "次の回戦の卓組みを実行")].click().run()
+    at.button[_find_button(at, "この結果で保存")].click().run()
+    assert not at.exception
+    assert len(db.get_rounds(tournament_id)) == 3
+    assert _round_select(at, tournament_id).value == 3
+    assert _score_labels(at) == _expected_labels(tournament_id, 3)
+    assert any(b.label == "第3回戦の成績を保存" for b in at.button)
+
+
+def test_standings_tie_note_only_for_point_tournaments(app_env):
+    user_id, tenant_id, tournament_id = _setup_admin_with_point_tournament(n=8, config=OVERALL_CONFIG)
+    _play_rounds(tenant_id, tournament_id, 1, random.Random(3))
+    raw_token = db.create_guest_link(tournament_id, user_id)
+    note = "素点合計の多い方 → 選手番号の若い方 の順で上にしています（席決めは選手番号の若い順）"
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+    assert any(note in c.value for c in at.caption)
+
+    guest = AppTest.from_file(APP_PATH)
+    guest.query_params["guest"] = raw_token
+    guest.run()
+    assert any(note in c.value for c in guest.caption)
+
+    tournament = db.get_tournament(tenant_id, tournament_id)
+    db.update_tournament(
+        tenant_id, tournament_id, tournament["name"], tournament["kind"], tournament["table_method"],
+        "得点", SCORE_CONFIG,
+        tournament["numbering_method"], None, None, tournament["status"],
+    )
+    guest2 = AppTest.from_file(APP_PATH)
+    guest2.query_params["guest"] = raw_token
+    guest2.run()
+    assert not guest2.exception
+    assert not any(note in c.value for c in guest2.caption)
