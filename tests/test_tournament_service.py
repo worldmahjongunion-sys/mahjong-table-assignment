@@ -6,6 +6,7 @@ import random
 import pytest
 
 import db
+import table_logic
 import tournament_service as svc
 
 
@@ -347,22 +348,20 @@ def test_cumulative_and_standings_are_per_table_across_rounds(temp_db):
 
 
 def test_snake_next_round_uses_per_table_cumulative_points(temp_db):
-    """蛇行方式の次回戦の並び順: 卓ごとの順位ポイント（同ポイントは選手番号順）で1〜8位を
-    決め、蛇行で卓A={1,4,5,8位}・卓B={2,3,6,7位}に振り分ける。"""
+    """蛇行方式の次回戦の並び順: 卓ごとの順位ポイント（同ポイントは大会内順位表と同じく
+    素点合計の多い順、2026-11-19）で1〜8位を決め、蛇行で卓A={1,4,5,8位}・卓B={2,3,6,7位}に
+    振り分ける。"""
     tournament, round1, table1, table2 = _setup_two_table_round("ポイント", POINT_CONFIG)
     tid = tournament["id"]
     number_of = {m["member_id"]: m["player_number"] for m in db.get_tournament_members(tid)}
     _save_scores(round1, table1, (50000, 30000, 20000, 10000))
     _save_scores(round1, table2, (8000, 6000, 4000, 2000))
 
-    # 3点・1点・-1点・-3点の組が卓1・卓2に1人ずつ。同点内は選手番号の若い順
-    def by_number(a, b):
-        return sorted([a, b], key=number_of.get)
-
-    w_a, w_b = by_number(table1[0], table2[0])
-    s_a, s_b = by_number(table1[1], table2[1])
-    t_a, t_b = by_number(table1[2], table2[2])
-    l_a, l_b = by_number(table1[3], table2[3])
+    # 3点・1点・-1点・-3点の組が卓1・卓2に1人ずつ。同点内は素点合計の多い順（どの組も卓1が上）
+    w_a, w_b = table1[0], table2[0]
+    s_a, s_b = table1[1], table2[1]
+    t_a, t_b = table1[2], table2[2]
+    l_a, l_b = table1[3], table2[3]
     expected_tables = [
         {number_of[m] for m in (w_a, s_b, t_a, l_b)},
         {number_of[m] for m in (w_b, s_a, t_b, l_a)},
@@ -374,3 +373,6 @@ def test_snake_next_round_uses_per_table_cumulative_points(temp_db):
     assert round_number == 2
     assert absent == []
     assert [set(t.values()) for t in tables] == expected_tables
+    # 席決めの並びは大会内順位表と同じ
+    standings = [row["player_number"] for row in svc.compute_standings(tournament)]
+    assert tables == table_logic.snake_tables(standings)
