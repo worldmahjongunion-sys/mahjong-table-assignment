@@ -71,6 +71,11 @@ def points_input(label: str, points: int, key: str, min_points: int | None = Non
     if min_points is not None:
         min_hundreds = scoring_logic.points_to_hundreds(min_points)
         kwargs["min_value"] = min_hundreds if is_int else float(min_hundreds)
+    # 値をsession_stateから入れ直したとき（「最新の状態に更新」）は、初期値を渡すと
+    # Streamlitが「初期値とSession Stateの両方で値を決めている」という注意を画面に出すので渡さない。
+    # number_inputはkeyで同じ入力欄と見なすので、初期値を渡さなくても別の欄にはならない。
+    if key in st.session_state:
+        value = None
     entered = st.number_input(label, value=value, step=1 if is_int else 1.0, key=key, **kwargs)
     return scoring_logic.hundreds_to_points(entered)
 
@@ -1700,6 +1705,35 @@ for tournament in tournaments:
             # 主催者が自分で値を書き換えた卓は、DBが変わっていなければ食い違いにならない
             # (＝ゲストの入力の修正はこれまでどおりできる)。
             score_basis = st.session_state.setdefault(f"score_basis_{selected_round_id}", {})
+
+            # 「最新の状態に更新」: スマホ（ゲスト）で保存された成績を、ログアウトせずに入力欄へ
+            # 読み込み直す（ブラウザの再読み込みはログアウトになることがあるため。2026-11-19
+            # staging リハーサルから）。DBが画面を作ったときから変わった選手（＝他の人が入力した
+            # 選手）の入力欄だけを作り直し、主催者が打ちかけの他の卓の入力はそのまま残す。
+            # 入力欄が作られる前なので、ここで入力欄の値を消してよい。
+            if st.button("最新の状態に更新", key=f"refresh_results_{selected_round_id}"):
+                refreshed = 0
+                for seat in seats:
+                    member_id = seat["member_id"]
+                    current = (existing_scores.get(member_id), sorted(existing_busters.get(member_id, [])))
+                    if member_id in score_basis and score_basis[member_id] != current:
+                        # 消すだけでは、サーバー側は新しい値になってもブラウザの欄が古い値のまま
+                        # 残る（実機で確認）。値を入れ直すと、ブラウザの欄にも送られる。
+                        st.session_state[f"score_{selected_round_id}_{member_id}"] = (
+                            scoring_logic.points_to_hundreds(existing_scores.get(member_id, 0))
+                        )
+                        # 飛ばした人の欄は、初期値（DBの値）が変わると別の欄として作り直される
+                        st.session_state.pop(f"busters_{selected_round_id}_{member_id}", None)
+                        del score_basis[member_id]
+                        refreshed += 1
+                st.caption(
+                    "最新の状態にしました。" + ("ほかの人が入力した成績を読み込みました。" if refreshed else "")
+                )
+
+            save_flash_key = f"score_save_flash_{selected_round_id}"
+            if save_flash_key in st.session_state:
+                st.success(st.session_state.pop(save_flash_key))
+
             for seat in seats:
                 member_id = seat["member_id"]
                 if f"score_{selected_round_id}_{member_id}" not in st.session_state or member_id not in score_basis:
@@ -1774,8 +1808,8 @@ for tournament in tournaments:
                 if entered_by_someone_else:
                     # 合計エラー(古い入力欄の0など)を出す代わりに再読み込みを促し、この卓は保存しない
                     st.warning(
-                        f"卓{table_number}は他の人が入力済みです。ページを再読み込みしてください"
-                        "（この卓は保存されません）。"
+                        f"卓{table_number}は他の人が入力済みです。上の「最新の状態に更新」を押してください"
+                        "（このままではこの卓は保存されません）。"
                     )
                     continue
 
@@ -1836,7 +1870,12 @@ for tournament in tournaments:
                             if mid in tobi_busters_input:
                                 busters_to_save[mid] = tobi_busters_input[mid]
                     if not scores_to_save:
-                        st.info("保存する変更はありません。")
+                        # 保存した直後にもう一度押した、などのとき。「保存しました」の表示は
+                        # 消えているので、保存されていないと誤解されないように言い分ける
+                        if seats and all(seat["member_id"] in existing_scores for seat in seats):
+                            st.info("この回戦の成績は保存済みです（変更はありません）。")
+                        else:
+                            st.info("入力した卓がないため、保存していません。")
                     else:
                         try:
                             # 画面を作ったときに読んだ値を渡し、保存の直前にDBと比べる(その間に
@@ -1851,13 +1890,20 @@ for tournament in tournaments:
                         except db.ResultsChangedError:
                             st.error(
                                 "保存できませんでした。保存の直前に他の人がこの回戦の成績を入力しました。"
-                                "ページを再読み込みしてから、もう一度保存してください。"
+                                "上の「最新の状態に更新」を押してから、もう一度保存してください。"
                             )
                         else:
                             # 自分の保存でDBが変わった分は「他の人の入力」扱いにしない
                             for mid, score in scores_to_save.items():
                                 score_basis[mid] = (score, sorted(busters_to_save.get(mid, [])))
-                            st.success("成績を保存しました。")
+                            # st.rerun() で画面を作り直すと、ここで出したメッセージは消えてしまう。
+                            # 消えると保存されたか分からず、もう一度押して「変更はありません」と
+                            # 出て紛らわしかった（2026-11-19 staging リハーサルから）。
+                            # 作り直した画面で出すように、メッセージを覚えておく。
+                            saved_table_names = "・".join(f"卓{n}" for n in sorted(save_tables))
+                            st.session_state[save_flash_key] = (
+                                f"第{selected_round_number}回戦の成績を保存しました（{saved_table_names}）。"
+                            )
                             st.rerun()
 
             if existing_scores:
