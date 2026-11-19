@@ -165,6 +165,49 @@ def test_snake_round_final_round_seats_in_rank_order_with_ties_by_player_number(
     ]
 
 
+# 席決めの同点: 大会内順位表と同じ（累計 → 素点合計 → 選手番号、2026-11-19）
+# 12名。累計10点で G=7番(素点合計650)・C=3番(610)・K=11番(610) が7〜9位に並ぶ。
+TIE12_POINTS = {1: 30, 2: 25, 4: 20, 5: 18, 6: 15, 8: 12, 7: 10, 3: 10, 11: 10, 9: 8, 10: 5, 12: 2}
+TIE12_RAW = {pn: 600 for pn in range(1, 13)}
+TIE12_RAW.update({7: 650, 3: 610, 11: 610})
+TIE12_RANKED = [1, 2, 4, 5, 6, 8, 7, 3, 11, 9, 10, 12]
+TIE12_SNAKE = [
+    {"東": 1, "南": 8, "西": 7, "北": 12},
+    {"東": 2, "南": 6, "西": 3, "北": 10},
+    {"東": 4, "南": 5, "西": 11, "北": 9},
+]
+
+
+def test_standings_order_uses_raw_sum_then_player_number():
+    assert table_logic.standings_order(list(range(1, 13)), TIE12_POINTS, TIE12_RAW) == TIE12_RANKED
+    # 素点合計がなければ（得点方式）、同点は選手番号の若い順
+    assert table_logic.standings_order([7, 3, 11], TIE12_POINTS) == [3, 7, 11]
+
+
+def test_snake_round_tie_uses_raw_sum_12_players():
+    _, tables = table_logic.snake_round(
+        list(range(1, 13)), {}, set(), TIE12_POINTS, random.Random(0), tiebreak_scores=TIE12_RAW
+    )
+    assert tables == TIE12_SNAKE
+    # 7位=G(7番)が卓1、8位=C(3番)が卓2、9位=K(11番)が卓3
+    assert [next(i + 1 for i, t in enumerate(tables) if pn in t.values()) for pn in (7, 3, 11)] == [1, 2, 3]
+
+
+def test_snake_round_final_round_tie_uses_raw_sum_8_players():
+    members = list(range(1, 9))
+    # 選手3と選手5が累計同点。素点合計は5の方が多い → 5が上（選手番号では3が上）
+    cumulative = {8: 30, 7: 25, 3: 20, 5: 20, 1: 10, 2: 9, 4: 8, 6: 1}
+    raw = {pn: 100000 for pn in members}
+    raw.update({3: 95000, 5: 105000})
+    _, tables = table_logic.snake_round(
+        members, {}, set(), cumulative, random.Random(0), final_round=True, tiebreak_scores=raw
+    )
+    assert tables == [
+        {"東": 8, "南": 7, "西": 5, "北": 3},
+        {"東": 1, "南": 2, "西": 4, "北": 6},
+    ]
+
+
 # ---------------------------------------------------------------------------
 # tournament_service: DBを通した計算
 # ---------------------------------------------------------------------------
@@ -291,7 +334,10 @@ def test_five_hanchan_simulation(temp_db, n, seed):
         if round_number == 1:
             assert seats == table_logic.ranked_order_tables(list(range(1, n + 1))), "第1回戦は選手番号順"
         if round_number >= 2:
-            ranked = sorted(range(1, n + 1), key=lambda pn: (-cumulative.get(pn, 0), pn))
+            # 席決めは大会内順位表と同じ並び（累計 → 素点合計 → 選手番号、2026-11-19）
+            ranked = sorted(range(1, n + 1), key=lambda pn: (-cumulative.get(pn, 0), -raw_sums.get(pn, 0), pn))
+            standings = [row["player_number"] for row in svc.compute_standings(tournament)]
+            assert standings == ranked, f"第{round_number}回戦の前の順位表"
             if round_number == 5:
                 expected = table_logic.ranked_order_tables(ranked)
             else:
@@ -496,3 +542,45 @@ def test_next_round_is_fixed(temp_db):
 
     tournament2 = dict(tournament2, table_method="ワンデー")
     assert not svc.next_round_is_fixed(tournament2, 8)
+
+
+# ---------------------------------------------------------------------------
+# 席決めと大会内順位表が同じ並びになる（2026-11-19）
+# ---------------------------------------------------------------------------
+
+def _save_first_round(tenant_id, tid):
+    tournament = db.get_tournament(tenant_id, tid)
+    rn, absent, tables = svc.run_next_round(tournament, random.Random(1))
+    svc.save_confirmed_round(tid, rn, absent, tables)
+    return db.get_tournament(tenant_id, tid)
+
+
+def test_service_snake_seating_matches_standings_on_tie(temp_db, monkeypatch):
+    tenant_id, tid = _setup(12, OVERALL_CONFIG)
+    tournament = _save_first_round(tenant_id, tid)
+    monkeypatch.setattr(svc, "build_cumulative_scores", lambda t: dict(TIE12_POINTS))
+    monkeypatch.setattr(svc, "_cumulative_raw_score_sum", lambda tournament_id: dict(TIE12_RAW))
+
+    standings = [row["player_number"] for row in svc.compute_standings(tournament)]
+    assert standings == TIE12_RANKED
+    rn, absent, tables = svc.run_next_round(tournament, random.Random(2))
+    assert rn == 2 and absent == []
+    assert tables == TIE12_SNAKE
+    assert tables == table_logic.snake_tables(standings)
+
+
+def test_service_final_round_seating_matches_standings_on_tie(temp_db, monkeypatch):
+    tenant_id, tid = _setup(8, dict(OVERALL_CONFIG, total_rounds=2))
+    tournament = _save_first_round(tenant_id, tid)
+    cumulative = {8: 30, 7: 25, 3: 20, 5: 20, 1: 10, 2: 9, 4: 8, 6: 1}
+    raw = {pn: 100000 for pn in range(1, 9)}
+    raw.update({3: 95000, 5: 105000})
+    monkeypatch.setattr(svc, "build_cumulative_scores", lambda t: dict(cumulative))
+    monkeypatch.setattr(svc, "_cumulative_raw_score_sum", lambda tournament_id: dict(raw))
+
+    standings = [row["player_number"] for row in svc.compute_standings(tournament)]
+    assert standings == [8, 7, 5, 3, 1, 2, 4, 6]
+    rn, absent, tables = svc.run_next_round(tournament, random.Random(2))
+    assert rn == 2
+    assert tables == table_logic.ranked_order_tables(standings)
+    assert tables[0] == {"東": 8, "南": 7, "西": 5, "北": 3}

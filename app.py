@@ -239,7 +239,7 @@ def render_scoring_config_inputs(scoring_mode: str, key_prefix: str, defaults: d
 def render_standings_tie_note(tournament: dict) -> None:
     """大会内順位表の下の1行。ポイント方式は同点の並べ方が席決めと違うので、そのことを書いておく。"""
     if tournament["scoring_mode"] == "ポイント":
-        st.caption("累計が同点のときは、素点合計の多い方 → 選手番号の若い方 の順で上にしています（席決めは選手番号の若い順）。")
+        st.caption("累計が同点のときは、素点合計の多い方 → 選手番号の若い方 の順で上にしています（次の回戦の席決めも同じ順です）。")
 
 
 def render_final_ranking(tournament: dict, member_id_to_name: dict) -> None:

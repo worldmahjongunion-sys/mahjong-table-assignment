@@ -215,6 +215,17 @@ def _cumulative_raw_score_sum(tournament_id):
     return cumulative
 
 
+def build_tiebreak_scores(tournament):
+    """累計が同点のときの2段目（素点合計）。ポイント方式だけ。得点方式は None。
+
+    大会内順位表（compute_standings）と蛇行の席決め（run_next_round）で同じ値を使う
+    （2026-11-19）。
+    """
+    if tournament["scoring_mode"] == "得点":
+        return None
+    return _cumulative_raw_score_sum(tournament["id"])
+
+
 def is_final_round(tournament, round_number):
     """全回戦数が設定されていて、round_numberがその最終回戦か。"""
     total_rounds = get_total_rounds(tournament)
@@ -258,6 +269,7 @@ def run_next_round(tournament, rng=None):
             player_numbers, appearance_counts, previous_absent, cumulative_scores, rng,
             final_round=is_final_round(tournament, round_number),
             ordered_first_round=get_total_rounds(tournament) is not None,
+            tiebreak_scores=None if round_number == 1 else build_tiebreak_scores(tournament),
         )
     else:
         position_history = build_position_history(tournament_id)
@@ -286,17 +298,15 @@ def compute_standings(tournament):
     各要素: {"member_id", "player_number", "value"}（valueは累計得点または累計順位ポイント）
     得点方式: 累計得点の降順（同点は選手番号昇順）
     ポイント方式: 累計順位ポイント→素点合計→選手番号の3段階タイブレーク
+    席決め（蛇行）も table_logic.standings_order で同じ並びにする。
     """
     _, number_to_member = _player_number_map(tournament["id"])
     cumulative = build_cumulative_scores(tournament)
 
-    if tournament["scoring_mode"] == "得点":
-        ordered_numbers = sorted(cumulative.keys(), key=lambda pn: (-cumulative.get(pn, 0), pn))
-    else:
-        raw_score_sums = _cumulative_raw_score_sum(tournament["id"])
-        ordered_numbers = scoring_logic.rank_by_points_then_score(
-            list(cumulative.keys()), cumulative, raw_score_sums
-        )
+    # 席決め（run_next_round → table_logic.snake_rank）と同じ関数で並べる
+    ordered_numbers = table_logic.standings_order(
+        list(cumulative.keys()), cumulative, build_tiebreak_scores(tournament)
+    )
 
     return [
         {"member_id": number_to_member[pn], "player_number": pn, "value": cumulative.get(pn, 0)}

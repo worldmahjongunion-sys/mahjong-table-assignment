@@ -99,18 +99,34 @@ def update_co_seat_counts(co_seat_counts, tables):
     return updated
 
 
-def snake_rank(members, cumulative_scores, rng):
+def snake_rank(members, cumulative_scores, rng, tiebreak_scores=None):
     """蛇行方式の順位付け（4.2手順1・2）。
 
     cumulative_scores: {選手番号: 大会内累計ポイント}。Noneなら「第1回戦
     （まだ成績がない）」としてランダムな仮順位を用いる。
+    tiebreak_scores: {選手番号: 素点合計}。累計が同点のときに多い方を上にする
+    （ポイント方式の大会。大会内順位表と同じ並び、2026-11-19）。Noneなら使わない。
     戻り値: 選手番号のリスト（1位から順）。
     """
     if cumulative_scores is None:
         ranked = list(members)
         rng.shuffle(ranked)
         return ranked
-    return sorted(members, key=lambda p: (-cumulative_scores.get(p, 0), p))
+    return standings_order(members, cumulative_scores, tiebreak_scores)
+
+
+def standings_order(players, cumulative_scores, tiebreak_scores=None):
+    """大会内の順位の並び: 累計の多い順 → 素点合計の多い順 → 選手番号の若い順。
+
+    大会内順位表（tournament_service.compute_standings）と蛇行の席決め（snake_rank）の
+    両方がこの関数を使い、並びが食い違わないようにする（2026-11-19）。
+    tiebreak_scores が None（得点方式）なら、累計 → 選手番号の2段階。
+    """
+    tiebreak_scores = tiebreak_scores or {}
+    return sorted(
+        players,
+        key=lambda p: (-cumulative_scores.get(p, 0), -tiebreak_scores.get(p, 0), p),
+    )
 
 
 def snake_tables(ranked_players):
@@ -158,7 +174,7 @@ def ranked_order_tables(ranked_players):
 
 
 def snake_round(members, appearance_counts, previous_absent, cumulative_scores, rng, final_round=False,
-                ordered_first_round=False):
+                ordered_first_round=False, tiebreak_scores=None):
     """蛇行方式：1回戦分の抜け番選出＋卓組みを行う。
 
     final_round=True（大会の全回戦数が決まっていて、これが最終回戦）のときは、
@@ -170,13 +186,15 @@ def snake_round(members, appearance_counts, previous_absent, cumulative_scores, 
     8人なら 卓1 = 東1番・南2番・西3番・北4番、卓2 = 東5番〜北8番。
     抜け番が出る人数のときは、抜け番の選び方（4.1）だけはこれまでどおり。
 
+    tiebreak_scores: 累計が同点のときの2段目（素点合計）。snake_rank 参照。
+
     戻り値: (抜け番リスト, 卓のリスト)
     """
     _, r = compute_table_count_and_absent(len(members))
     absent, remaining = select_absent_members(members, appearance_counts, previous_absent, r, rng)
     if cumulative_scores is None and ordered_first_round:
         return absent, ranked_order_tables(sorted(remaining))
-    ranked = snake_rank(remaining, cumulative_scores, rng)
+    ranked = snake_rank(remaining, cumulative_scores, rng, tiebreak_scores)
     if final_round and cumulative_scores is not None:
         tables = ranked_order_tables(ranked)
     else:

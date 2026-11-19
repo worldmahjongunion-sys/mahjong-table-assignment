@@ -287,7 +287,7 @@ def test_standings_tie_note_only_for_point_tournaments(app_env):
     user_id, tenant_id, tournament_id = _setup_admin_with_point_tournament(n=8, config=OVERALL_CONFIG)
     _play_rounds(tenant_id, tournament_id, 1, random.Random(3))
     raw_token = db.create_guest_link(tournament_id, user_id)
-    note = "素点合計の多い方 → 選手番号の若い方 の順で上にしています（席決めは選手番号の若い順）"
+    note = "素点合計の多い方 → 選手番号の若い方 の順で上にしています（次の回戦の席決めも同じ順です）"
 
     at = AppTest.from_file(APP_PATH)
     at.run()
