@@ -951,7 +951,7 @@ def test_tournament_edit_form_rejects_wrong_digits(app_env):
 
 GUEST_T1 = (45000, 35000, 32000, 28000)   # ゲストが送る卓1(合計140000)
 ADMIN_T2 = (60000, 40000, 30000, 10000)   # 主催者が入れる卓2(合計140000)
-STALE_TABLE_MESSAGE = "卓1は他の人が入力済みです。ページを再読み込みしてください"
+STALE_TABLE_MESSAGE = "卓1は他の人が入力済みです。上の「最新の状態に更新」を押してください"
 CHANGED_JUST_BEFORE_SAVE_MESSAGE = "保存の直前に他の人がこの回戦の成績を入力しました"
 
 
@@ -1083,3 +1083,72 @@ def test_admin_screen_is_not_stale_after_its_own_save(app_env):
     assert not at.exception
     assert not any(STALE_TABLE_MESSAGE in w.value for w in at.warning)
     assert [db.get_round_results(round_id)[m] for m in table1] == [61000, 39000, 30000, 10000]
+
+
+# ---------------------------------------------------------------------------
+# 「最新の状態に更新」と、保存の直後のメッセージ（2026-11-19 staging リハーサルから）
+# ---------------------------------------------------------------------------
+
+def _admin_score_values(at, member_ids):
+    values = {int(ni.key.rsplit("_", 1)[1]): ni.value for ni in at.number_input if ni.key and ni.key.startswith("score_")}
+    return [values[m] for m in member_ids]
+
+
+def test_refresh_button_loads_guest_scores_and_keeps_admin_typing(app_env):
+    """主催者が卓2を打ちかけの間に、ゲストが卓1を送信。「最新の状態に更新」で卓1の欄に
+    ゲストの素点が入り、打ちかけの卓2はそのまま残る。そのあと保存しても卓1は上書きされない。"""
+    _, _, round_id, table1, table2 = _setup_two_table_round()
+    at = _open_admin()
+    _set_admin_scores(at, dict(zip(table2, ADMIN_T2)))
+    db.submit_guest_round_results(round_id, dict(zip(table1, GUEST_T1)), {})  # 別の端末から
+    at.run()
+    assert _admin_score_values(at, table1) == [0, 0, 0, 0]  # 古いまま
+    assert any(STALE_TABLE_MESSAGE in w.value for w in at.warning)
+
+    at.button[_find_button(at, "最新の状態に更新")].click().run()
+
+    assert not at.exception
+    assert _admin_score_values(at, table1) == [v // 100 for v in GUEST_T1]
+    assert _admin_score_values(at, table2) == [v // 100 for v in ADMIN_T2]  # 打ちかけは残る
+    assert not any(STALE_TABLE_MESSAGE in w.value for w in at.warning)
+
+    at.button[_find_button(at, "成績を保存")].click().run()
+    assert not at.exception
+    saved = db.get_round_results(round_id)
+    assert [saved[m] for m in table1] == list(GUEST_T1)
+    assert [saved[m] for m in table2] == list(ADMIN_T2)
+    meta = db.get_round_result_meta(round_id)
+    assert all(meta[m]["input_source"] == "guest" for m in table1)  # 卓1は入れ直されていない
+
+
+def test_refresh_button_without_changes_keeps_inputs(app_env):
+    _, _, round_id, table1, _ = _setup_two_table_round()
+    at = _open_admin()
+    _set_admin_scores(at, {table1[0]: 45000})
+    at.button[_find_button(at, "最新の状態に更新")].click().run()
+    assert not at.exception
+    assert _admin_score_values(at, table1)[0] == 450
+    assert any("最新の状態にしました" in c.value for c in at.caption)
+
+
+def test_save_message_survives_rerun_and_second_press_says_already_saved(app_env):
+    """保存の直後に「保存しました」が残る。もう一度押すと「保存済みです（変更はありません）」。"""
+    _, _, round_id, table1, table2 = _setup_two_table_round()
+    at = _open_admin()
+    _set_admin_scores(at, {**dict(zip(table1, GUEST_T1)), **dict(zip(table2, ADMIN_T2))})
+    at.button[_find_button(at, "成績を保存")].click().run()
+
+    assert not at.exception
+    assert any("第1回戦の成績を保存しました（卓1・卓2）。" in s.value for s in at.success)
+    assert not any("保存する変更はありません" in i.value for i in at.info)
+
+    at.button[_find_button(at, "成績を保存")].click().run()
+    assert any("この回戦の成績は保存済みです（変更はありません）。" in i.value for i in at.info)
+    assert not any("成績を保存しました" in s.value for s in at.success)  # 前のメッセージは1回だけ
+
+
+def test_save_with_nothing_entered_says_not_saved(app_env):
+    _setup_two_table_round()
+    at = _open_admin()
+    at.button[_find_button(at, "成績を保存")].click().run()
+    assert any("入力した卓がないため、保存していません。" in i.value for i in at.info)
