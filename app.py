@@ -276,6 +276,53 @@ def render_final_ranking(tournament: dict, member_id_to_name: dict) -> None:
     )
 
 
+def selectbox_following_default(label: str, options: list, default, key: str, jump_key: str | None = None):
+    """初期値（default）に合わせて動くselectbox。
+
+    利用者が自分で別の値を選ぶまでは、defaultが変わるたびに（新しい回戦ができた、
+    卓の入力が済んだなど）表示もdefaultに切り替える。自分で選んだ値はそのまま残す。
+    jump_key の session_state が立っていれば（保存の直後など）、選んだ値に関係なく
+    defaultへ切り替える（立っていた印は消す）。
+    ゲスト画面は開いたまま大会の進行を見ることが多く、Streamlitのselectboxは一度
+    選ばれた値を保つので、何もしないと最初に開いた回戦・卓のままになる（2026-11-19）。
+    """
+    auto_key = f"{key}__default"
+    current = st.session_state.get(key)
+    jump = bool(jump_key and st.session_state.pop(jump_key, False))
+    if jump or current not in options or current == st.session_state.get(auto_key):
+        st.session_state[key] = default
+    st.session_state[auto_key] = default
+    return st.selectbox(label, options=options, key=key)
+
+
+def guest_default_round(round_numbers: list, unfinished_round_numbers: set):
+    """ゲスト画面の回戦の初期値: 未入力の卓がある最新の回戦。全卓入力済みなら最新の回戦。"""
+    unfinished = [rn for rn in round_numbers if rn in unfinished_round_numbers]
+    return max(unfinished) if unfinished else max(round_numbers)
+
+
+def guest_default_table(table_numbers: list, entered_table_numbers: set, after=None):
+    """ゲスト画面の卓の初期値: 最初の未入力の卓（after を渡すと、その卓より後ろの未入力の卓。
+    なければ前に戻って探す）。全卓入力済みなら最初の卓。"""
+    ordered = sorted(table_numbers)
+    if after is not None and after in ordered:
+        i = ordered.index(after)
+        ordered = ordered[i + 1:] + ordered[:i + 1]
+    for tn in ordered:
+        if tn not in entered_table_numbers:
+            return tn
+    return min(table_numbers)
+
+
+def _entered_table_numbers(round_id) -> set:
+    """回戦のうち、4人とも素点が入っている卓の番号。"""
+    scores = db.get_round_results(round_id)
+    by_table: dict[int, list] = {}
+    for seat in db.get_round_seats(round_id):
+        by_table.setdefault(seat["table_number"], []).append(seat["member_id"])
+    return {tn for tn, mids in by_table.items() if all(mid in scores for mid in mids)}
+
+
 def render_guest_view(guest_token: str) -> None:
     """ゲスト共有リンク(`?guest=<トークン>`)専用画面（ゲスト向け画面実装依頼_Stage2.md 3章対応）。
 
@@ -300,8 +347,15 @@ def render_guest_view(guest_token: str) -> None:
 
     round_options = {r["round_number"]: r["id"] for r in rounds}
     round_numbers = list(round_options.keys())
-    selected_round_number = st.selectbox(
-        "回戦", options=round_numbers, index=len(round_numbers) - 1, key="guest_round_select"
+    # 初期値は「未入力の卓がある最新の回戦」（全卓入力済みなら最新の回戦）。大会の途中で
+    # リンクを開く人・開いたまま待つ人が多いので、新しい回戦ができたらそちらへ切り替える
+    unfinished_rounds = set()
+    for rn, rid in round_options.items():
+        seat_tables = {s["table_number"] for s in db.get_round_seats(rid)}
+        if seat_tables - _entered_table_numbers(rid):
+            unfinished_rounds.add(rn)
+    selected_round_number = selectbox_following_default(
+        "回戦", round_numbers, guest_default_round(round_numbers, unfinished_rounds), key="guest_round_select"
     )
     selected_round_id = round_options[selected_round_number]
 
@@ -339,7 +393,19 @@ def render_guest_view(guest_token: str) -> None:
         st.caption("この回戦は卓がありません。")
     else:
         table_numbers = sorted(by_table.keys())
-        selected_table_number = st.selectbox("卓を選択", options=table_numbers, key="guest_table_select")
+        entered_tables = {
+            tn for tn, ts in by_table.items() if all(s["member_id"] in existing_scores for s in ts)
+        }
+        # 初期値は最初の未入力の卓。送信した直後は、次の未入力の卓へ切り替える
+        table_select_key = f"guest_table_select_{selected_round_id}"
+        just_submitted = st.session_state.get(f"{table_select_key}__submitted")
+        selected_table_number = selectbox_following_default(
+            "卓を選択",
+            table_numbers,
+            guest_default_table(table_numbers, entered_tables, after=just_submitted),
+            key=table_select_key,
+            jump_key=f"{table_select_key}__jump",
+        )
         table_seats = by_table[selected_table_number]
         table_member_ids = [s["member_id"] for s in table_seats]
         already_submitted = all(mid in existing_scores for mid in table_member_ids)
@@ -410,6 +476,9 @@ def render_guest_view(guest_token: str) -> None:
                 else:
                     try:
                         db.submit_guest_round_results(selected_round_id, raw_scores_input, tobi_busters_input)
+                        # 次の表示で、この卓の次の未入力の卓へ切り替える
+                        st.session_state[f"{table_select_key}__jump"] = True
+                        st.session_state[f"{table_select_key}__submitted"] = selected_table_number
                         st.success("送信しました。")
                         st.rerun()
                     except db.ResultsAlreadySubmittedError:
