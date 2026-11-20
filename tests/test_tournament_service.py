@@ -347,6 +347,31 @@ def test_cumulative_and_standings_are_per_table_across_rounds(temp_db):
     ]
 
 
+def test_standings_raw_total_is_the_tiebreak_value(temp_db):
+    """累計順位表の「素点合計」（raw_total）は並び順の2段目と同じ値。得点方式は None（2026-11-20）。"""
+    tournament, round1, table1, table2 = _setup_two_table_round("ポイント", POINT_CONFIG)
+    tid = tournament["id"]
+    _save_scores(round1, table1, (50000, 30000, 20000, 10000))  # 卓2は未入力
+    tournament = db.get_tournament(db.get_user_by_username("owner")["tenant_id"], tid)
+    number_of = {m["member_id"]: m["player_number"] for m in db.get_tournament_members(tid)}
+
+    standings = svc.compute_standings(tournament)
+    tiebreak = svc.build_tiebreak_scores(tournament)
+    assert [row["raw_total"] for row in standings] == [tiebreak.get(row["player_number"], 0) for row in standings]
+    raw_by_member = {row["member_id"]: row["raw_total"] for row in standings}
+    assert [raw_by_member[m] for m in table1] == [50000, 30000, 20000, 10000]
+    # 卓2は未入力なので、今までどおり表にまだ出ない（出る人の素点合計は .get(.., 0) で0扱い）
+    assert not set(table2) & set(raw_by_member)
+    assert all(number_of[row["member_id"]] == row["player_number"] for row in standings)
+
+
+def test_standings_raw_total_is_none_for_score_mode(temp_db):
+    tournament, round1, table1, _ = _setup_two_table_round("得点", SCORE_CONFIG)
+    _save_scores(round1, table1, (50000, 30000, 20000, 10000))
+    tournament = db.get_tournament(db.get_user_by_username("owner")["tenant_id"], tournament["id"])
+    assert all(row["raw_total"] is None for row in svc.compute_standings(tournament))
+
+
 def test_snake_next_round_uses_per_table_cumulative_points(temp_db):
     """蛇行方式の次回戦の並び順: 卓ごとの順位ポイント（同ポイントは累計順位表と同じく
     素点合計の多い順、2026-11-19）で1〜8位を決め、蛇行で卓A={1,4,5,8位}・卓B={2,3,6,7位}に

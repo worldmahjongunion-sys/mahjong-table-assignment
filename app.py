@@ -93,6 +93,19 @@ def standings_value_column_label(scoring_mode: str) -> str:
     return "総合得点" if scoring_mode == "得点" else "合計ポイント"
 
 
+def standings_value_columns(scoring_mode: str, row: dict) -> dict:
+    """累計順位表の値の列。ポイント方式は「合計ポイント」の右隣に「素点合計」（参考表示）を足す。
+
+    素点合計は並び順の2段目と同じ値（compute_standings の raw_total）を、成績入力と同じ
+    100点単位で出す（35,000点なら350）。累計ポイントが同点のときに、なぜその順位かが
+    画面から分かるように（2026-11-20 staging 確認から）。得点方式は今までどおり。
+    """
+    columns = {standings_value_column_label(scoring_mode): format_result_value(scoring_mode, row["value"])}
+    if scoring_mode != "得点" and row.get("raw_total") is not None:
+        columns["素点合計"] = scoring_logic.format_hundreds(row["raw_total"])
+    return columns
+
+
 def render_tournament_format_inputs(key_prefix: str, scoring_mode: str, defaults: dict | None = None,
                                     member_count: int = 0) -> dict:
     """全回戦数と、ポイント評価の順位の付け方（卓ごと/全員まとめて）の入力欄（12/19大会向け実装依頼）。
@@ -499,9 +512,7 @@ def render_guest_view(guest_token: str) -> None:
                 {
                     "順位": i + 1,
                     "氏名": member_id_to_name.get(row["member_id"], row["member_id"]),
-                    standings_value_column_label(tournament["scoring_mode"]): format_result_value(
-                        tournament["scoring_mode"], row["value"]
-                    ),
+                    **standings_value_columns(tournament["scoring_mode"], row),
                     "参加回戦数": appearance_counts.get(row["player_number"], 0),
                 }
                 for i, row in enumerate(standings)
@@ -1940,9 +1951,7 @@ for tournament in tournaments:
                         "順位": i + 1,
                         "選手番号": row["player_number"],
                         "氏名": member_id_to_name_all.get(row["member_id"], row["member_id"]),
-                        standings_value_column_label(tournament["scoring_mode"]): format_result_value(
-                            tournament["scoring_mode"], row["value"]
-                        ),
+                        **standings_value_columns(tournament["scoring_mode"], row),
                     }
                     for i, row in enumerate(standings)
                 ]
