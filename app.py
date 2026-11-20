@@ -88,7 +88,7 @@ def format_result_value(scoring_mode: str, value) -> str:
 
 
 def standings_value_column_label(scoring_mode: str) -> str:
-    """大会内順位表の値の列見出し。「点」(実際の点数)と「ポイント」(評価値)の用語を統一するため、
+    """累計順位表の値の列見出し。「点」(実際の点数)と「ポイント」(評価値)の用語を統一するため、
     汎用的な「値」ではなく評価方式に応じた具体的な名称にする。"""
     return "総合得点" if scoring_mode == "得点" else "合計ポイント"
 
@@ -242,7 +242,7 @@ def render_scoring_config_inputs(scoring_mode: str, key_prefix: str, defaults: d
 
 
 def render_standings_tie_note(tournament: dict) -> None:
-    """大会内順位表の下の1行。ポイント方式は同点の並べ方が席決めと違うので、そのことを書いておく。"""
+    """累計順位表の下の1行。ポイント方式は同点の並べ方が席決めと違うので、そのことを書いておく。"""
     if tournament["scoring_mode"] == "ポイント":
         st.caption("累計が同点のときは、素点合計の多い方 → 選手番号の若い方 の順で上にしています（次の回戦の席決めも同じ順です）。")
 
@@ -486,7 +486,7 @@ def render_guest_view(guest_token: str) -> None:
 
     st.divider()
     render_final_ranking(tournament, member_id_to_name)
-    st.write("**大会内順位表**")
+    st.write("**累計順位表**")
     if tournament["scoring_mode"] == "得点":
         st.caption("総合得点は100点単位で表示しています（458は45,800点）")
     standings = tournament_service.compute_standings(tournament)
@@ -1913,7 +1913,7 @@ for tournament in tournaments:
                 if not totals and tournament_service.get_rank_scope(tournament) == tournament_service.RANK_SCOPE_OVERALL:
                     st.caption("全員まとめて順位を付けるため、全卓の入力がそろうと順位ポイントが出ます。")
                 st.caption(
-                    "この回戦の計算結果（"
+                    f"第{selected_round_number}回戦の計算結果（"
                     + ("総合得点・100点単位" if tournament["scoring_mode"] == "得点" else "順位ポイント")
                     + "）"
                 )
@@ -1924,11 +1924,11 @@ for tournament in tournaments:
                     ]
                 )
 
-        # ---- 大会内順位表 ----
+        # ---- 累計順位表 ----
         if rounds:
             member_id_to_name_all = {tm["member_id"]: tm["member_name"] for tm in tournament_members}
             render_final_ranking(tournament, member_id_to_name_all)
-            st.write("**大会内順位表**")
+            st.write("**累計順位表**")
             if tournament["scoring_mode"] == "得点":
                 st.caption("総合得点は100点単位で表示しています（458は45,800点）")
             if tournament_service.get_rank_scope(tournament) == tournament_service.RANK_SCOPE_OVERALL:

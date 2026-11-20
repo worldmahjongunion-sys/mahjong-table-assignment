@@ -747,7 +747,7 @@ def test_point_mode_values_are_shown_without_trailing_zeros_and_per_table(app_en
     assert value_columns, "値の列を持つ表が表示されていない"
     flat = [v for column in value_columns for v in column]
     assert not any(v.endswith(".0000") or v.endswith(".0") for v in flat)
-    # この回戦の計算結果表(値の降順): 卓2の1位4、卓1の同着2.5×2、卓2の2位1、...
+    # 第N回戦の計算結果表(値の降順): 卓2の1位4、卓1の同着2.5×2、卓2の2位1、...
     assert sorted(value_columns[0], key=float, reverse=True) == ["4", "2.5", "2.5", "1", "-2", "-2.5", "-2.5", "-3"]
 
 
@@ -865,8 +865,8 @@ def test_admin_shows_score_mode_totals_in_hundreds(app_env):
     assert not at.exception
     columns = [[str(v) for v in t.value["値"]] for t in at.table if "値" in t.value.columns]
     standings_columns = [[str(v) for v in t.value["総合得点"]] for t in at.table if "総合得点" in t.value.columns]
-    assert columns[0] == ["940", "580", "170", "-290"]  # この回戦の計算結果(値の降順)
-    assert standings_columns[0] == ["940", "580", "170", "-290"]  # 大会内順位表
+    assert columns[0] == ["940", "580", "170", "-290"]  # 第N回戦の計算結果(値の降順)
+    assert standings_columns[0] == ["940", "580", "170", "-290"]  # 累計順位表
 
 
 def test_admin_score_input_in_hundreds_saves_actual_points(app_env):
@@ -1137,6 +1137,18 @@ def test_refresh_button_is_primary_and_other_buttons_unchanged(app_env):
     at = _open_admin()
     assert at.button[_find_button(at, "最新の状態に更新")].proto.type == "primary"
     assert at.button[_find_button(at, "成績を保存")].proto.type != "primary"
+
+
+def test_headings_name_round_number_and_cumulative_standings(app_env):
+    """見出しは「第N回戦の計算結果（…）」と「累計順位表」（2026-11-20 staging 確認から）。"""
+    _, _, round_id, table1, table2 = _setup_two_table_round()
+    db.submit_guest_round_results(round_id, dict(zip(table1, GUEST_T1)), {})
+    at = _open_admin()
+    assert not at.exception
+    assert any(c.value == "第1回戦の計算結果（総合得点・100点単位）" for c in at.caption)  # 得点方式
+    texts = [m.value for m in at.markdown]
+    assert "**累計順位表**" in texts
+    assert not any("大会内順位表" in t or "この回戦の計算結果" in t for t in texts + [c.value for c in at.caption])
 
 
 def test_save_message_survives_rerun_and_second_press_says_already_saved(app_env):

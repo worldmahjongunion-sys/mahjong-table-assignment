@@ -218,7 +218,7 @@ def _cumulative_raw_score_sum(tournament_id):
 def build_tiebreak_scores(tournament):
     """累計が同点のときの2段目（素点合計）。ポイント方式だけ。得点方式は None。
 
-    大会内順位表（compute_standings）と蛇行の席決め（run_next_round）で同じ値を使う
+    累計順位表（compute_standings）と蛇行の席決め（run_next_round）で同じ値を使う
     （2026-11-19）。
     """
     if tournament["scoring_mode"] == "得点":

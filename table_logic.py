@@ -105,7 +105,7 @@ def snake_rank(members, cumulative_scores, rng, tiebreak_scores=None):
     cumulative_scores: {選手番号: 大会内累計ポイント}。Noneなら「第1回戦
     （まだ成績がない）」としてランダムな仮順位を用いる。
     tiebreak_scores: {選手番号: 素点合計}。累計が同点のときに多い方を上にする
-    （ポイント方式の大会。大会内順位表と同じ並び、2026-11-19）。Noneなら使わない。
+    （ポイント方式の大会。累計順位表と同じ並び、2026-11-19）。Noneなら使わない。
     戻り値: 選手番号のリスト（1位から順）。
     """
     if cumulative_scores is None:
@@ -118,7 +118,7 @@ def snake_rank(members, cumulative_scores, rng, tiebreak_scores=None):
 def standings_order(players, cumulative_scores, tiebreak_scores=None):
     """大会内の順位の並び: 累計の多い順 → 素点合計の多い順 → 選手番号の若い順。
 
-    大会内順位表（tournament_service.compute_standings）と蛇行の席決め（snake_rank）の
+    累計順位表（tournament_service.compute_standings）と蛇行の席決め（snake_rank）の
     両方がこの関数を使い、並びが食い違わないようにする（2026-11-19）。
     tiebreak_scores が None（得点方式）なら、累計 → 選手番号の2段階。
     """
