@@ -1,6 +1,7 @@
 import os
 import secrets
 import smtplib
+import time
 from datetime import datetime, timezone
 from email.message import EmailMessage
 
@@ -75,6 +76,10 @@ def points_input(label: str, points: int, key: str, min_points: int | None = Non
     # Streamlitが「初期値とSession Stateの両方で値を決めている」という注意を画面に出すので渡さない。
     # number_inputはkeyで同じ入力欄と見なすので、初期値を渡さなくても別の欄にはならない。
     if key in st.session_state:
+        # 画面の作り直しが途中で打ち切られると、覚えている値が空(None)になることがある
+        # （ログイン直後に Cookie の部品で作り直しが重なったとき。2026-11-20）。空なら初期値に戻す。
+        if st.session_state[key] is None:
+            st.session_state[key] = value
         value = None
     entered = st.number_input(label, value=value, step=1 if is_int else 1.0, key=key, **kwargs)
     return scoring_logic.hundreds_to_points(entered)
@@ -684,6 +689,7 @@ if checkout_status == "cancel":
     st.stop()
 
 # ---- 通常のログイン／サインアップ ----
+AUTH_COOKIE_REWRITE_SECONDS = 15  # ログイン後、Cookie を書かせる部品を置き直す時間
 auth_cookie_name = get_auth_setting("AUTH_COOKIE_NAME", "cookie_name")
 auth_cookie_key = get_auth_setting("AUTH_COOKIE_KEY", "cookie_key")
 auth_invite_code = get_auth_setting("AUTH_INVITE_CODE", "invite_code")
@@ -743,6 +749,7 @@ if not st.session_state.get("authentication_status"):
                 st.session_state["username"] = login_user["username"]
                 st.session_state["name"] = login_user["username"]
                 authenticator.cookie_controller.set_cookie()
+                st.session_state["auth_cookie_pending_until"] = time.time() + AUTH_COOKIE_REWRITE_SECONDS
                 db.record_audit_log(
                     action="login",
                     tenant_id=login_user["tenant_id"],
@@ -755,6 +762,12 @@ if not st.session_state.get("authentication_status"):
                 st.session_state["authentication_status"] = False
 
 auth_status = st.session_state.get("authentication_status")
+
+# ログイン直後の st.rerun() で、Cookie を書かせる部品（ブラウザ側で動く）が動く前に消され、
+# Cookie が書かれず F5 でログアウトしていた（通信に遅れがあると毎回。2026-11-20 staging）。
+# ログインからしばらくは、画面を作り直すたびに部品を置き直して、書き込みが終わるまで残す。
+if auth_status and st.session_state.get("auth_cookie_pending_until", 0) > time.time():
+    authenticator.cookie_controller.set_cookie()
 
 if auth_status is False:
     st.error("ユーザー名またはパスワードが違います。")
