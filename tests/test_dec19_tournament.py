@@ -165,7 +165,7 @@ def test_snake_round_final_round_seats_in_rank_order_with_ties_by_player_number(
     ]
 
 
-# 席決めの同点: 大会内順位表と同じ（累計 → 素点合計 → 選手番号、2026-11-19）
+# 席決めの同点: 累計順位表と同じ（累計 → 素点合計 → 選手番号、2026-11-19）
 # 12名。累計10点で G=7番(素点合計650)・C=3番(610)・K=11番(610) が7〜9位に並ぶ。
 TIE12_POINTS = {1: 30, 2: 25, 4: 20, 5: 18, 6: 15, 8: 12, 7: 10, 3: 10, 11: 10, 9: 8, 10: 5, 12: 2}
 TIE12_RAW = {pn: 600 for pn in range(1, 13)}
@@ -334,7 +334,7 @@ def test_five_hanchan_simulation(temp_db, n, seed):
         if round_number == 1:
             assert seats == table_logic.ranked_order_tables(list(range(1, n + 1))), "第1回戦は選手番号順"
         if round_number >= 2:
-            # 席決めは大会内順位表と同じ並び（累計 → 素点合計 → 選手番号、2026-11-19）
+            # 席決めは累計順位表と同じ並び（累計 → 素点合計 → 選手番号、2026-11-19）
             ranked = sorted(range(1, n + 1), key=lambda pn: (-cumulative.get(pn, 0), -raw_sums.get(pn, 0), pn))
             standings = [row["player_number"] for row in svc.compute_standings(tournament)]
             assert standings == ranked, f"第{round_number}回戦の前の順位表"
@@ -545,7 +545,7 @@ def test_next_round_is_fixed(temp_db):
 
 
 # ---------------------------------------------------------------------------
-# 席決めと大会内順位表が同じ並びになる（2026-11-19）
+# 席決めと累計順位表が同じ並びになる（2026-11-19）
 # ---------------------------------------------------------------------------
 
 def _save_first_round(tenant_id, tid):

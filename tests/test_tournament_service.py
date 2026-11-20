@@ -324,7 +324,7 @@ def test_uncompleted_table_is_not_scored(temp_db):
 
 
 def test_cumulative_and_standings_are_per_table_across_rounds(temp_db):
-    """累計・大会内順位表も卓ごとの値の積み上げになる（2回戦分）。"""
+    """累計・累計順位表も卓ごとの値の積み上げになる（2回戦分）。"""
     tournament, round1, table1, table2 = _setup_two_table_round("ポイント", POINT_CONFIG)
     tid = tournament["id"]
     _save_scores(round1, table1, (50000, 30000, 20000, 10000))
@@ -348,7 +348,7 @@ def test_cumulative_and_standings_are_per_table_across_rounds(temp_db):
 
 
 def test_snake_next_round_uses_per_table_cumulative_points(temp_db):
-    """蛇行方式の次回戦の並び順: 卓ごとの順位ポイント（同ポイントは大会内順位表と同じく
+    """蛇行方式の次回戦の並び順: 卓ごとの順位ポイント（同ポイントは累計順位表と同じく
     素点合計の多い順、2026-11-19）で1〜8位を決め、蛇行で卓A={1,4,5,8位}・卓B={2,3,6,7位}に
     振り分ける。"""
     tournament, round1, table1, table2 = _setup_two_table_round("ポイント", POINT_CONFIG)
@@ -373,6 +373,6 @@ def test_snake_next_round_uses_per_table_cumulative_points(temp_db):
     assert round_number == 2
     assert absent == []
     assert [set(t.values()) for t in tables] == expected_tables
-    # 席決めの並びは大会内順位表と同じ
+    # 席決めの並びは累計順位表と同じ
     standings = [row["player_number"] for row in svc.compute_standings(tournament)]
     assert tables == table_logic.snake_tables(standings)
