@@ -1711,7 +1711,9 @@ for tournament in tournaments:
             # staging リハーサルから）。DBが画面を作ったときから変わった選手（＝他の人が入力した
             # 選手）の入力欄だけを作り直し、主催者が打ちかけの他の卓の入力はそのまま残す。
             # 入力欄が作られる前なので、ここで入力欄の値を消してよい。
-            if st.button("最新の状態に更新", key=f"refresh_results_{selected_round_id}"):
+            if st.button(
+                "最新の状態に更新", key=f"refresh_results_{selected_round_id}", type="primary"
+            ):
                 refreshed = 0
                 for seat in seats:
                     member_id = seat["member_id"]

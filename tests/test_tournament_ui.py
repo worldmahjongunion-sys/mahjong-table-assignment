@@ -1131,6 +1131,14 @@ def test_refresh_button_without_changes_keeps_inputs(app_env):
     assert any("最新の状態にしました" in c.value for c in at.caption)
 
 
+def test_refresh_button_is_primary_and_other_buttons_unchanged(app_env):
+    """「最新の状態に更新」だけを目立つ色（primary）にする（2026-11-20 staging 確認から）。"""
+    _setup_two_table_round()
+    at = _open_admin()
+    assert at.button[_find_button(at, "最新の状態に更新")].proto.type == "primary"
+    assert at.button[_find_button(at, "成績を保存")].proto.type != "primary"
+
+
 def test_save_message_survives_rerun_and_second_press_says_already_saved(app_env):
     """保存の直後に「保存しました」が残る。もう一度押すと「保存済みです（変更はありません）」。"""
     _, _, round_id, table1, table2 = _setup_two_table_round()
