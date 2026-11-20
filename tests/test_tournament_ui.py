@@ -14,6 +14,7 @@ import streamlit_authenticator as stauth
 from streamlit.testing.v1 import AppTest
 
 import db
+import scoring_logic
 import tournament_service as svc
 
 APP_PATH = str(Path(__file__).parent.parent / "app.py")
@@ -1149,6 +1150,54 @@ def test_headings_name_round_number_and_cumulative_standings(app_env):
     texts = [m.value for m in at.markdown]
     assert "**累計順位表**" in texts
     assert not any("大会内順位表" in t or "この回戦の計算結果" in t for t in texts + [c.value for c in at.caption])
+
+
+def _standings_table(at):
+    return next(
+        t.value for t in at.table
+        if "順位" in t.value.columns and ("合計ポイント" in t.value.columns or "総合得点" in t.value.columns)
+    )
+
+
+def _setup_point_round_with_both_tables():
+    """ポイント方式・8人2卓の第1回戦を両卓とも入力済みにする。各順位とも卓2の方が素点が高い。"""
+    _, tournament_id, round_id, table1, table2 = _setup_two_table_round("ポイント", POINT_CONFIG)
+    db.submit_guest_round_results(round_id, dict(zip(table1, GUEST_T1)), {})
+    db.submit_guest_round_results(round_id, dict(zip(table2, ADMIN_T2)), {})
+    return tournament_id, table1, table2
+
+
+def test_standings_shows_raw_total_next_to_points_for_admin_and_guest(app_env):
+    """ポイント方式の累計順位表に「素点合計」（100点単位）が「合計ポイント」の右隣に出る。
+    値は並び順に使う素点合計と同じ（2026-11-20 staging 確認から）。"""
+    tournament_id, table1, table2 = _setup_point_round_with_both_tables()
+    user_id = db.get_user_by_username("admin1")["id"]
+    raw_token = db.create_guest_link(tournament_id, user_id)
+    tenant_id = db.get_user_by_id(user_id)["tenant_id"]
+    standings = svc.compute_standings(db.get_tournament(tenant_id, tournament_id))
+    expected = [scoring_logic.format_hundreds(row["raw_total"]) for row in standings]
+    # 同ポイント（卓1の1位と卓2の1位など）は素点合計の多い卓2の人が上
+    assert [row["member_id"] for row in standings][:2] == [table2[0], table1[0]]
+    assert expected[:2] == ["600", "450"]
+
+    admin = _open_admin()
+    guest = AppTest.from_file(APP_PATH)
+    guest.query_params["guest"] = raw_token
+    guest.run()
+    for at in (admin, guest):
+        assert not at.exception
+        table = _standings_table(at)
+        columns = list(table.columns)
+        assert columns.index("素点合計") == columns.index("合計ポイント") + 1
+        assert [str(v) for v in table["素点合計"]] == expected
+
+
+def test_standings_has_no_raw_total_for_score_mode(app_env):
+    _, _, round_id, table1, table2 = _setup_two_table_round()  # 得点方式
+    db.submit_guest_round_results(round_id, dict(zip(table1, GUEST_T1)), {})
+    at = _open_admin()
+    assert not at.exception
+    assert "素点合計" not in _standings_table(at).columns
 
 
 def test_save_message_survives_rerun_and_second_press_says_already_saved(app_env):

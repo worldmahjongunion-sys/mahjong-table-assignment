@@ -295,7 +295,9 @@ def save_confirmed_round(tournament_id, round_number, absent_player_numbers, tab
 def compute_standings(tournament):
     """大会内の現在の順位表を返す（1位から順のリスト）。
 
-    各要素: {"member_id", "player_number", "value"}（valueは累計得点または累計順位ポイント）
+    各要素: {"member_id", "player_number", "value", "raw_total"}
+    （valueは累計得点または累計順位ポイント。raw_totalはポイント方式の素点合計＝ウマ・オカ・
+    飛び賞を含まない実際の点数の合計で、並び順の2段目と同じ値。未入力の人は0。得点方式はNone）
     得点方式: 累計得点の降順（同点は選手番号昇順）
     ポイント方式: 累計順位ポイント→素点合計→選手番号の3段階タイブレーク
     席決め（蛇行）も table_logic.standings_order で同じ並びにする。
@@ -303,13 +305,17 @@ def compute_standings(tournament):
     _, number_to_member = _player_number_map(tournament["id"])
     cumulative = build_cumulative_scores(tournament)
 
+    tiebreak = build_tiebreak_scores(tournament)
     # 席決め（run_next_round → table_logic.snake_rank）と同じ関数で並べる
-    ordered_numbers = table_logic.standings_order(
-        list(cumulative.keys()), cumulative, build_tiebreak_scores(tournament)
-    )
+    ordered_numbers = table_logic.standings_order(list(cumulative.keys()), cumulative, tiebreak)
 
     return [
-        {"member_id": number_to_member[pn], "player_number": pn, "value": cumulative.get(pn, 0)}
+        {
+            "member_id": number_to_member[pn],
+            "player_number": pn,
+            "value": cumulative.get(pn, 0),
+            "raw_total": None if tiebreak is None else tiebreak.get(pn, 0),
+        }
         for pn in ordered_numbers
     ]
 
