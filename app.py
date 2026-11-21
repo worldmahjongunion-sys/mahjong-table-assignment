@@ -1,6 +1,7 @@
 import os
 import secrets
 import smtplib
+import time
 from datetime import datetime, timezone
 from email.message import EmailMessage
 
@@ -71,6 +72,15 @@ def points_input(label: str, points: int, key: str, min_points: int | None = Non
     if min_points is not None:
         min_hundreds = scoring_logic.points_to_hundreds(min_points)
         kwargs["min_value"] = min_hundreds if is_int else float(min_hundreds)
+    # 値をsession_stateから入れ直したとき（「最新の状態に更新」）は、初期値を渡すと
+    # Streamlitが「初期値とSession Stateの両方で値を決めている」という注意を画面に出すので渡さない。
+    # number_inputはkeyで同じ入力欄と見なすので、初期値を渡さなくても別の欄にはならない。
+    if key in st.session_state:
+        # 画面の作り直しが途中で打ち切られると、覚えている値が空(None)になることがある
+        # （ログイン直後に Cookie の部品で作り直しが重なったとき。2026-11-20）。空なら初期値に戻す。
+        if st.session_state[key] is None:
+            st.session_state[key] = value
+        value = None
     entered = st.number_input(label, value=value, step=1 if is_int else 1.0, key=key, **kwargs)
     return scoring_logic.hundreds_to_points(entered)
 
@@ -83,9 +93,83 @@ def format_result_value(scoring_mode: str, value) -> str:
 
 
 def standings_value_column_label(scoring_mode: str) -> str:
-    """大会内順位表の値の列見出し。「点」(実際の点数)と「ポイント」(評価値)の用語を統一するため、
+    """累計順位表の値の列見出し。「点」(実際の点数)と「ポイント」(評価値)の用語を統一するため、
     汎用的な「値」ではなく評価方式に応じた具体的な名称にする。"""
     return "総合得点" if scoring_mode == "得点" else "合計ポイント"
+
+
+def standings_value_columns(scoring_mode: str, row: dict) -> dict:
+    """累計順位表の値の列。ポイント方式は「合計ポイント」の右隣に「素点合計」（参考表示）を足す。
+
+    素点合計は並び順の2段目と同じ値（compute_standings の raw_total）を、成績入力と同じ
+    100点単位で出す（35,000点なら350）。累計ポイントが同点のときに、なぜその順位かが
+    画面から分かるように（2026-11-20 staging 確認から）。得点方式は今までどおり。
+    """
+    columns = {standings_value_column_label(scoring_mode): format_result_value(scoring_mode, row["value"])}
+    if scoring_mode != "得点" and row.get("raw_total") is not None:
+        columns["素点合計"] = scoring_logic.format_hundreds(row["raw_total"])
+    return columns
+
+
+def render_tournament_format_inputs(key_prefix: str, scoring_mode: str, defaults: dict | None = None,
+                                    member_count: int = 0) -> dict:
+    """全回戦数と、ポイント評価の順位の付け方（卓ごと/全員まとめて）の入力欄（12/19大会向け実装依頼）。
+
+    戻り値はscoring_configに足すキーの辞書。全員まとめての順位ポイント表の書き方が
+    おかしいときは "_error" に画面に出す文言を入れて返す（呼び出し側で保存を止める）。
+    """
+    defaults = defaults or {}
+    result = {}
+    total_rounds = st.number_input(
+        "全回戦数（0なら未設定。設定すると蛇行方式の最終回戦は累計順位の順に着席し、"
+        "最終回戦の結果で最終順位を出します）",
+        min_value=0, step=1, value=int(defaults.get("total_rounds") or 0),
+        key=f"{key_prefix}_total_rounds",
+    )
+    if total_rounds:
+        result["total_rounds"] = int(total_rounds)
+
+    if scoring_mode != "ポイント":
+        return result
+
+    scope_default = defaults.get("rank_scope", tournament_service.RANK_SCOPE_PER_TABLE)
+    rank_scope = st.selectbox(
+        "順位の付け方",
+        tournament_service.RANK_SCOPES,
+        index=tournament_service.RANK_SCOPES.index(scope_default),
+        key=f"{key_prefix}_rank_scope",
+        help="卓ごと: 卓の中で1〜4位を付けます。全員まとめて: その回戦の全卓の全員を素点順に並べ、"
+             "N人ならN点〜1点を付けます（全卓の入力がそろってから計算）。",
+    )
+    result["rank_scope"] = rank_scope
+
+    saved_table = defaults.get("overall_rank_point_table") or []
+    if saved_table:
+        initial_text = ",".join(scoring_logic.format_point_value(v) for v in saved_table)
+    elif member_count:
+        initial_text = ",".join(str(v) for v in scoring_logic.default_overall_point_table(member_count))
+    else:
+        initial_text = ""
+    table_text = st.text_input(
+        "全員まとめての順位ポイント表（1位から、カンマ区切り。空欄なら参加人数Nから N点〜1点 を自動で使います）",
+        value=initial_text,
+        key=f"{key_prefix}_overall_rank_point_table",
+    )
+    try:
+        table = scoring_logic.parse_point_table_text(table_text)
+    except ValueError:
+        result["_error"] = "全員まとめての順位ポイント表は、数字をカンマで区切って入力してください（例: 8,7,6,5,4,3,2,1）。"
+        return result
+    if table and member_count and len(table) != member_count:
+        result["_error"] = (
+            f"全員まとめての順位ポイント表が{len(table)}人分です。参加メンバーは{member_count}人です。"
+            "人数分を入力するか、空欄にしてください。"
+        )
+        return result
+    # 参加人数ぶんの N〜1 と同じなら保存しない（人数が変わっても自動で追従させるため）
+    if table and table != scoring_logic.default_overall_point_table(len(table)):
+        result["overall_rank_point_table"] = table
+    return result
 
 
 def render_scoring_config_inputs(scoring_mode: str, key_prefix: str, defaults: dict | None = None) -> dict:
@@ -175,6 +259,88 @@ def render_scoring_config_inputs(scoring_mode: str, key_prefix: str, defaults: d
     return {"rank_point_table": rank_point_table_input, "start_point": start_point}
 
 
+def render_standings_tie_note(tournament: dict) -> None:
+    """累計順位表の下の1行。ポイント方式は同点の並べ方が席決めと違うので、そのことを書いておく。"""
+    if tournament["scoring_mode"] == "ポイント":
+        st.caption("累計が同点のときは、素点合計の多い方 → 選手番号の若い方 の順で上にしています（次の回戦の席決めも同じ順です）。")
+
+
+def render_final_ranking(tournament: dict, member_id_to_name: dict) -> None:
+    """最終順位（全回戦数を設定した大会のみ）。最終回戦の全卓がそろうまでは案内だけ出す。"""
+    total_rounds = tournament_service.get_total_rounds(tournament)
+    if total_rounds is None:
+        return
+    st.write("**最終順位**")
+    final_rows = tournament_service.compute_final_ranking(tournament)
+    if final_rows is None:
+        st.caption(f"第{total_rounds}回戦（最終回戦）の全卓の入力がそろうと表示されます。")
+        return
+    cumulative_label = "累計得点" if tournament["scoring_mode"] == "得点" else "累計ポイント"
+    st.caption(
+        f"1卓の1位が優勝。2位以下は第{total_rounds}回戦の素点順です（素点は100点単位）。"
+        f"第{total_rounds}回戦の素点が同点のときは、全{total_rounds}回戦の{cumulative_label}が多い方 → "
+        f"全{total_rounds}回戦の素点合計が多い方 → 選手番号の若い方 の順で上位にします。"
+    )
+    st.table(
+        [
+            {
+                "順位": "優勝" if i == 0 else i + 1,
+                "氏名": member_id_to_name.get(row["member_id"], row["member_id"]),
+                f"第{total_rounds}回戦": f"卓{row['table_number']}",
+                "素点": scoring_logic.format_hundreds(row["raw_score"]),
+            }
+            for i, row in enumerate(final_rows)
+        ]
+    )
+
+
+def selectbox_following_default(label: str, options: list, default, key: str, jump_key: str | None = None):
+    """初期値（default）に合わせて動くselectbox。
+
+    利用者が自分で別の値を選ぶまでは、defaultが変わるたびに（新しい回戦ができた、
+    卓の入力が済んだなど）表示もdefaultに切り替える。自分で選んだ値はそのまま残す。
+    jump_key の session_state が立っていれば（保存の直後など）、選んだ値に関係なく
+    defaultへ切り替える（立っていた印は消す）。
+    ゲスト画面は開いたまま大会の進行を見ることが多く、Streamlitのselectboxは一度
+    選ばれた値を保つので、何もしないと最初に開いた回戦・卓のままになる（2026-11-19）。
+    """
+    auto_key = f"{key}__default"
+    current = st.session_state.get(key)
+    jump = bool(jump_key and st.session_state.pop(jump_key, False))
+    if jump or current not in options or current == st.session_state.get(auto_key):
+        st.session_state[key] = default
+    st.session_state[auto_key] = default
+    return st.selectbox(label, options=options, key=key)
+
+
+def guest_default_round(round_numbers: list, unfinished_round_numbers: set):
+    """ゲスト画面の回戦の初期値: 未入力の卓がある最新の回戦。全卓入力済みなら最新の回戦。"""
+    unfinished = [rn for rn in round_numbers if rn in unfinished_round_numbers]
+    return max(unfinished) if unfinished else max(round_numbers)
+
+
+def guest_default_table(table_numbers: list, entered_table_numbers: set, after=None):
+    """ゲスト画面の卓の初期値: 最初の未入力の卓（after を渡すと、その卓より後ろの未入力の卓。
+    なければ前に戻って探す）。全卓入力済みなら最初の卓。"""
+    ordered = sorted(table_numbers)
+    if after is not None and after in ordered:
+        i = ordered.index(after)
+        ordered = ordered[i + 1:] + ordered[:i + 1]
+    for tn in ordered:
+        if tn not in entered_table_numbers:
+            return tn
+    return min(table_numbers)
+
+
+def _entered_table_numbers(round_id) -> set:
+    """回戦のうち、4人とも素点が入っている卓の番号。"""
+    scores = db.get_round_results(round_id)
+    by_table: dict[int, list] = {}
+    for seat in db.get_round_seats(round_id):
+        by_table.setdefault(seat["table_number"], []).append(seat["member_id"])
+    return {tn for tn, mids in by_table.items() if all(mid in scores for mid in mids)}
+
+
 def render_guest_view(guest_token: str) -> None:
     """ゲスト共有リンク(`?guest=<トークン>`)専用画面（ゲスト向け画面実装依頼_Stage2.md 3章対応）。
 
@@ -199,8 +365,15 @@ def render_guest_view(guest_token: str) -> None:
 
     round_options = {r["round_number"]: r["id"] for r in rounds}
     round_numbers = list(round_options.keys())
-    selected_round_number = st.selectbox(
-        "回戦", options=round_numbers, index=len(round_numbers) - 1, key="guest_round_select"
+    # 初期値は「未入力の卓がある最新の回戦」（全卓入力済みなら最新の回戦）。大会の途中で
+    # リンクを開く人・開いたまま待つ人が多いので、新しい回戦ができたらそちらへ切り替える
+    unfinished_rounds = set()
+    for rn, rid in round_options.items():
+        seat_tables = {s["table_number"] for s in db.get_round_seats(rid)}
+        if seat_tables - _entered_table_numbers(rid):
+            unfinished_rounds.add(rn)
+    selected_round_number = selectbox_following_default(
+        "回戦", round_numbers, guest_default_round(round_numbers, unfinished_rounds), key="guest_round_select"
     )
     selected_round_id = round_options[selected_round_number]
 
@@ -238,7 +411,19 @@ def render_guest_view(guest_token: str) -> None:
         st.caption("この回戦は卓がありません。")
     else:
         table_numbers = sorted(by_table.keys())
-        selected_table_number = st.selectbox("卓を選択", options=table_numbers, key="guest_table_select")
+        entered_tables = {
+            tn for tn, ts in by_table.items() if all(s["member_id"] in existing_scores for s in ts)
+        }
+        # 初期値は最初の未入力の卓。送信した直後は、次の未入力の卓へ切り替える
+        table_select_key = f"guest_table_select_{selected_round_id}"
+        just_submitted = st.session_state.get(f"{table_select_key}__submitted")
+        selected_table_number = selectbox_following_default(
+            "卓を選択",
+            table_numbers,
+            guest_default_table(table_numbers, entered_tables, after=just_submitted),
+            key=table_select_key,
+            jump_key=f"{table_select_key}__jump",
+        )
         table_seats = by_table[selected_table_number]
         table_member_ids = [s["member_id"] for s in table_seats]
         already_submitted = all(mid in existing_scores for mid in table_member_ids)
@@ -309,13 +494,17 @@ def render_guest_view(guest_token: str) -> None:
                 else:
                     try:
                         db.submit_guest_round_results(selected_round_id, raw_scores_input, tobi_busters_input)
+                        # 次の表示で、この卓の次の未入力の卓へ切り替える
+                        st.session_state[f"{table_select_key}__jump"] = True
+                        st.session_state[f"{table_select_key}__submitted"] = selected_table_number
                         st.success("送信しました。")
                         st.rerun()
                     except db.ResultsAlreadySubmittedError:
                         st.warning("すでに入力済みです。ページを再読み込みしてください。")
 
     st.divider()
-    st.write("**大会内順位表**")
+    render_final_ranking(tournament, member_id_to_name)
+    st.write("**累計順位表**")
     if tournament["scoring_mode"] == "得点":
         st.caption("総合得点は100点単位で表示しています（458は45,800点）")
     standings = tournament_service.compute_standings(tournament)
@@ -328,14 +517,13 @@ def render_guest_view(guest_token: str) -> None:
                 {
                     "順位": i + 1,
                     "氏名": member_id_to_name.get(row["member_id"], row["member_id"]),
-                    standings_value_column_label(tournament["scoring_mode"]): format_result_value(
-                        tournament["scoring_mode"], row["value"]
-                    ),
+                    **standings_value_columns(tournament["scoring_mode"], row),
                     "参加回戦数": appearance_counts.get(row["player_number"], 0),
                 }
                 for i, row in enumerate(standings)
             ]
         )
+        render_standings_tie_note(tournament)
 
 
 def get_auth_setting(env_var: str, secrets_key: str) -> str:
@@ -501,6 +689,7 @@ if checkout_status == "cancel":
     st.stop()
 
 # ---- 通常のログイン／サインアップ ----
+AUTH_COOKIE_REWRITE_SECONDS = 15  # ログイン後、Cookie を書かせる部品を置き直す時間
 auth_cookie_name = get_auth_setting("AUTH_COOKIE_NAME", "cookie_name")
 auth_cookie_key = get_auth_setting("AUTH_COOKIE_KEY", "cookie_key")
 auth_invite_code = get_auth_setting("AUTH_INVITE_CODE", "invite_code")
@@ -560,6 +749,7 @@ if not st.session_state.get("authentication_status"):
                 st.session_state["username"] = login_user["username"]
                 st.session_state["name"] = login_user["username"]
                 authenticator.cookie_controller.set_cookie()
+                st.session_state["auth_cookie_pending_until"] = time.time() + AUTH_COOKIE_REWRITE_SECONDS
                 db.record_audit_log(
                     action="login",
                     tenant_id=login_user["tenant_id"],
@@ -572,6 +762,12 @@ if not st.session_state.get("authentication_status"):
                 st.session_state["authentication_status"] = False
 
 auth_status = st.session_state.get("authentication_status")
+
+# ログイン直後の st.rerun() で、Cookie を書かせる部品（ブラウザ側で動く）が動く前に消され、
+# Cookie が書かれず F5 でログアウトしていた（通信に遅れがあると毎回。2026-11-20 staging）。
+# ログインからしばらくは、画面を作り直すたびに部品を置き直して、書き込みが終わるまで残す。
+if auth_status and st.session_state.get("auth_cookie_pending_until", 0) > time.time():
+    authenticator.cookie_controller.set_cookie()
 
 if auth_status is False:
     st.error("ユーザー名またはパスワードが違います。")
@@ -1193,10 +1389,15 @@ else:
 
         with st.form("new_tournament_form"):
             new_scoring_config = render_scoring_config_inputs(new_scoring_mode, "new_tournament")
+            new_format = render_tournament_format_inputs("new_tournament", new_scoring_mode)
+            new_format_error = new_format.pop("_error", None)
+            new_scoring_config.update(new_format)
             create_submitted = st.form_submit_button("大会を作成")
             if create_submitted:
                 if not new_name.strip():
                     st.error("大会名を入力してください。")
+                elif new_format_error:
+                    st.error(new_format_error)
                 elif scoring_logic.scoring_config_points_out_of_range(new_scoring_config):
                     st.error(scoring_logic.HUNDREDS_OUT_OF_RANGE_MESSAGE)
                 else:
@@ -1277,10 +1478,20 @@ for tournament in tournaments:
                         edit_prefix,
                         defaults=tournament["scoring_config"] if edit_scoring_mode == tournament["scoring_mode"] else None,
                     )
+                    edit_format = render_tournament_format_inputs(
+                        edit_prefix,
+                        edit_scoring_mode,
+                        defaults=tournament["scoring_config"],
+                        member_count=len(db.get_tournament_members(tournament_id)),
+                    )
+                    edit_format_error = edit_format.pop("_error", None)
+                    edit_scoring_config.update(edit_format)
                     edit_submitted = st.form_submit_button("変更を保存")
                     if edit_submitted:
                         if not edit_name.strip():
                             st.error("大会名を入力してください。")
+                        elif edit_format_error:
+                            st.error(edit_format_error)
                         elif scoring_logic.scoring_config_points_out_of_range(edit_scoring_config):
                             st.error(scoring_logic.HUNDREDS_OUT_OF_RANGE_MESSAGE)
                         else:
@@ -1388,6 +1599,24 @@ for tournament in tournaments:
             if len(tournament_members) < 4:
                 st.caption("卓組みを実行するには、参加メンバーが4人以上必要です。")
             else:
+                existing_rounds = db.get_rounds(tournament_id)
+                if (
+                    tournament["table_method"] == "蛇行"
+                    and existing_rounds
+                    and not tournament_service.is_round_complete(existing_rounds[-1]["id"])
+                ):
+                    st.warning(
+                        f"第{existing_rounds[-1]['round_number']}回戦の入力がまだそろっていません。"
+                        "蛇行方式は累計ポイントで席を決めるので、全卓の入力を済ませてから実行してください。"
+                    )
+                total_rounds = tournament_service.get_total_rounds(tournament)
+                if total_rounds is not None and len(existing_rounds) >= total_rounds:
+                    st.info(f"全{total_rounds}回戦を実行済みです。")
+                if tournament_service.overall_point_table_mismatch(tournament):
+                    st.warning(
+                        "全員まとめての順位ポイント表の人数が参加メンバーの人数と合わないため、"
+                        "N点〜1点の初期値で計算しています。大会情報の編集で直してください。"
+                    )
                 col_run, col_reroll = st.columns(2)
                 if col_run.button("次の回戦の卓組みを実行", key=f"run_round_{tournament_id}"):
                     round_number, absent, tables = tournament_service.run_next_round(tournament)
@@ -1397,7 +1626,9 @@ for tournament in tournaments:
                         "tables": tables,
                     }
                     st.rerun()
-                if st.session_state.get(preview_key) and col_reroll.button(
+                if st.session_state.get(preview_key) and not tournament_service.next_round_is_fixed(
+                    tournament, len(tournament_members)
+                ) and col_reroll.button(
                     "作り直す（乱数を引き直す）", key=f"reroll_round_{tournament_id}"
                 ):
                     round_number, absent, tables = tournament_service.run_next_round(tournament)
@@ -1414,6 +1645,18 @@ for tournament in tournaments:
                 tm["player_number"]: tm["member_name"] for tm in tournament_members
             }
             st.write(f"第{preview['round_number']}回戦のプレビュー（未保存）")
+            if (
+                tournament["table_method"] == "蛇行"
+                and preview["round_number"] > 1
+                and tournament_service.is_final_round(tournament, preview["round_number"])
+            ):
+                st.caption("最終回戦のため、蛇行にせず累計順位の順に着席します（卓1に1〜4位）。")
+            if (
+                tournament["table_method"] == "蛇行"
+                and preview["round_number"] == 1
+                and tournament_service.get_total_rounds(tournament) is not None
+            ):
+                st.caption("第1回戦は、選手番号（受付順）の順に着席します（卓1に1〜4番）。")
             for table_number, table in enumerate(preview["tables"], start=1):
                 seat_line = "　".join(
                     f"{position}: {player_number_to_name.get(player_number, player_number)}"
@@ -1440,6 +1683,10 @@ for tournament in tournaments:
                     detail=f"tournament_id={tournament_id}, round_number={preview['round_number']}",
                 )
                 st.session_state.pop(preview_key, None)
+                # 保存した新しい回戦を、下の成績入力の「回戦を選択」で選んだ状態にする
+                # （この時点ではselectboxはまだ作られていないので、キーを消してよい）
+                st.session_state[f"score_round_choice_{tournament_id}"] = preview["round_number"]
+                st.session_state.pop(f"score_round_select_{tournament_id}", None)
                 st.success("回戦結果を保存しました。")
                 st.rerun()
 
@@ -1452,10 +1699,24 @@ for tournament in tournaments:
             st.caption("まだ回戦がありません。")
         else:
             round_options = {r["round_number"]: r["id"] for r in rounds}
+            # 上の「次の回戦の卓組みを実行」「作り直す」「この結果で保存」は st.rerun() で
+            # 実行を打ち切るため、その回はこのselectboxまで届かない。Streamlitは打ち切られた回に
+            # 出てこなかった入力欄の値を捨てるので、次の表示でselectboxが第1回戦に戻るのに、
+            # ブラウザの見た目は前の選択（例: 3）のまま残り、第1回戦の成績を上書きするおそれがあった。
+            # そこで選んだ回戦を入力欄とは別のキー（score_round_choice_）にも覚えておき、
+            # 値が捨てられていたら覚えておいた回戦で作り直す（2026-11-18 staging 確認で発見）。
+            round_select_key = f"score_round_select_{tournament_id}"
+            round_choice_key = f"score_round_choice_{tournament_id}"
+            if round_select_key not in st.session_state:
+                remembered = st.session_state.get(round_choice_key)
+                if remembered in round_options:
+                    st.session_state[round_select_key] = remembered
             selected_round_number = st.selectbox(
-                "回戦を選択", options=list(round_options.keys()), key=f"score_round_select_{tournament_id}"
+                "回戦を選択", options=list(round_options.keys()), key=round_select_key
             )
+            st.session_state[round_choice_key] = selected_round_number
             selected_round_id = round_options[selected_round_number]
+            st.write(f"**第{selected_round_number}回戦の成績入力**")
             seats = db.get_round_seats(selected_round_id)
             existing_scores = db.get_round_results(selected_round_id)
             existing_busters = db.get_round_tobi_busters(selected_round_id)
@@ -1468,6 +1729,37 @@ for tournament in tournaments:
             # 主催者が自分で値を書き換えた卓は、DBが変わっていなければ食い違いにならない
             # (＝ゲストの入力の修正はこれまでどおりできる)。
             score_basis = st.session_state.setdefault(f"score_basis_{selected_round_id}", {})
+
+            # 「最新の状態に更新」: スマホ（ゲスト）で保存された成績を、ログアウトせずに入力欄へ
+            # 読み込み直す（ブラウザの再読み込みはログアウトになることがあるため。2026-11-19
+            # staging リハーサルから）。DBが画面を作ったときから変わった選手（＝他の人が入力した
+            # 選手）の入力欄だけを作り直し、主催者が打ちかけの他の卓の入力はそのまま残す。
+            # 入力欄が作られる前なので、ここで入力欄の値を消してよい。
+            if st.button(
+                "最新の状態に更新", key=f"refresh_results_{selected_round_id}", type="primary"
+            ):
+                refreshed = 0
+                for seat in seats:
+                    member_id = seat["member_id"]
+                    current = (existing_scores.get(member_id), sorted(existing_busters.get(member_id, [])))
+                    if member_id in score_basis and score_basis[member_id] != current:
+                        # 消すだけでは、サーバー側は新しい値になってもブラウザの欄が古い値のまま
+                        # 残る（実機で確認）。値を入れ直すと、ブラウザの欄にも送られる。
+                        st.session_state[f"score_{selected_round_id}_{member_id}"] = (
+                            scoring_logic.points_to_hundreds(existing_scores.get(member_id, 0))
+                        )
+                        # 飛ばした人の欄は、初期値（DBの値）が変わると別の欄として作り直される
+                        st.session_state.pop(f"busters_{selected_round_id}_{member_id}", None)
+                        del score_basis[member_id]
+                        refreshed += 1
+                st.caption(
+                    "最新の状態にしました。" + ("ほかの人が入力した成績を読み込みました。" if refreshed else "")
+                )
+
+            save_flash_key = f"score_save_flash_{selected_round_id}"
+            if save_flash_key in st.session_state:
+                st.success(st.session_state.pop(save_flash_key))
+
             for seat in seats:
                 member_id = seat["member_id"]
                 if f"score_{selected_round_id}_{member_id}" not in st.session_state or member_id not in score_basis:
@@ -1542,8 +1834,8 @@ for tournament in tournaments:
                 if entered_by_someone_else:
                     # 合計エラー(古い入力欄の0など)を出す代わりに再読み込みを促し、この卓は保存しない
                     st.warning(
-                        f"卓{table_number}は他の人が入力済みです。ページを再読み込みしてください"
-                        "（この卓は保存されません）。"
+                        f"卓{table_number}は他の人が入力済みです。上の「最新の状態に更新」を押してください"
+                        "（このままではこの卓は保存されません）。"
                     )
                     continue
 
@@ -1580,7 +1872,7 @@ for tournament in tournaments:
                                 f"{scoring_logic.format_hundreds(expected_total)}になるよう確認してください。"
                             )
 
-            if is_admin and st.button("成績を保存", key=f"save_results_{selected_round_id}"):
+            if is_admin and st.button(f"第{selected_round_number}回戦の成績を保存", key=f"save_results_{selected_round_id}"):
                 # 依頼書3.5: 主催者の保存(修正を含む)にも、ゲスト入力と同じ「卓ごとの素点合計＝
                 # 開始点数×4」のチェックをかける。ずれている卓は上で赤字表示済みなので、ここでは
                 # 保存を止めるだけにする。
@@ -1604,7 +1896,12 @@ for tournament in tournaments:
                             if mid in tobi_busters_input:
                                 busters_to_save[mid] = tobi_busters_input[mid]
                     if not scores_to_save:
-                        st.info("保存する変更はありません。")
+                        # 保存した直後にもう一度押した、などのとき。「保存しました」の表示は
+                        # 消えているので、保存されていないと誤解されないように言い分ける
+                        if seats and all(seat["member_id"] in existing_scores for seat in seats):
+                            st.info("この回戦の成績は保存済みです（変更はありません）。")
+                        else:
+                            st.info("入力した卓がないため、保存していません。")
                     else:
                         try:
                             # 画面を作ったときに読んだ値を渡し、保存の直前にDBと比べる(その間に
@@ -1619,19 +1916,28 @@ for tournament in tournaments:
                         except db.ResultsChangedError:
                             st.error(
                                 "保存できませんでした。保存の直前に他の人がこの回戦の成績を入力しました。"
-                                "ページを再読み込みしてから、もう一度保存してください。"
+                                "上の「最新の状態に更新」を押してから、もう一度保存してください。"
                             )
                         else:
                             # 自分の保存でDBが変わった分は「他の人の入力」扱いにしない
                             for mid, score in scores_to_save.items():
                                 score_basis[mid] = (score, sorted(busters_to_save.get(mid, [])))
-                            st.success("成績を保存しました。")
+                            # st.rerun() で画面を作り直すと、ここで出したメッセージは消えてしまう。
+                            # 消えると保存されたか分からず、もう一度押して「変更はありません」と
+                            # 出て紛らわしかった（2026-11-19 staging リハーサルから）。
+                            # 作り直した画面で出すように、メッセージを覚えておく。
+                            saved_table_names = "・".join(f"卓{n}" for n in sorted(save_tables))
+                            st.session_state[save_flash_key] = (
+                                f"第{selected_round_number}回戦の成績を保存しました（{saved_table_names}）。"
+                            )
                             st.rerun()
 
             if existing_scores:
                 totals = tournament_service.compute_round_totals(tournament, selected_round_id)
+                if not totals and tournament_service.get_rank_scope(tournament) == tournament_service.RANK_SCOPE_OVERALL:
+                    st.caption("全員まとめて順位を付けるため、全卓の入力がそろうと順位ポイントが出ます。")
                 st.caption(
-                    "この回戦の計算結果（"
+                    f"第{selected_round_number}回戦の計算結果（"
                     + ("総合得点・100点単位" if tournament["scoring_mode"] == "得点" else "順位ポイント")
                     + "）"
                 )
@@ -1642,26 +1948,28 @@ for tournament in tournaments:
                     ]
                 )
 
-        # ---- 大会内順位表 ----
+        # ---- 累計順位表 ----
         if rounds:
-            st.write("**大会内順位表**")
+            member_id_to_name_all = {tm["member_id"]: tm["member_name"] for tm in tournament_members}
+            render_final_ranking(tournament, member_id_to_name_all)
+            st.write("**累計順位表**")
             if tournament["scoring_mode"] == "得点":
                 st.caption("総合得点は100点単位で表示しています（458は45,800点）")
+            if tournament_service.get_rank_scope(tournament) == tournament_service.RANK_SCOPE_OVERALL:
+                st.caption("順位ポイントは回戦ごとに全員まとめて付けます。全卓の入力がそろっていない回戦は、まだ足していません。")
             standings = tournament_service.compute_standings(tournament)
-            member_id_to_name_all = {tm["member_id"]: tm["member_name"] for tm in tournament_members}
             st.table(
                 [
                     {
                         "順位": i + 1,
                         "選手番号": row["player_number"],
                         "氏名": member_id_to_name_all.get(row["member_id"], row["member_id"]),
-                        standings_value_column_label(tournament["scoring_mode"]): format_result_value(
-                            tournament["scoring_mode"], row["value"]
-                        ),
+                        **standings_value_columns(tournament["scoring_mode"], row),
                     }
                     for i, row in enumerate(standings)
                 ]
             )
+            render_standings_tie_note(tournament)
 
         st.divider()
 

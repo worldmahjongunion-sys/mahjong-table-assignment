@@ -81,25 +81,95 @@ def _extract_uma_config_and_tobi(scoring_config):
     return uma_config, tobi_amount
 
 
+# 順位の付け方（ポイント評価のみ）。scoring_config["rank_scope"]に保存する。
+# キーがない既存の大会は「卓ごと」として扱う（後方互換）。
+RANK_SCOPE_PER_TABLE = "卓ごと"
+RANK_SCOPE_OVERALL = "全員まとめて"
+RANK_SCOPES = (RANK_SCOPE_PER_TABLE, RANK_SCOPE_OVERALL)
+
+
+def get_rank_scope(tournament):
+    """大会の順位の付け方。得点評価の大会は常に「卓ごと」。"""
+    if tournament["scoring_mode"] != "ポイント":
+        return RANK_SCOPE_PER_TABLE
+    return tournament["scoring_config"].get("rank_scope", RANK_SCOPE_PER_TABLE)
+
+
+def get_total_rounds(tournament):
+    """大会の全回戦数（scoring_config["total_rounds"]）。未設定ならNone。"""
+    value = tournament["scoring_config"].get("total_rounds")
+    return int(value) if value else None
+
+
+def overall_point_table_for(tournament, player_count):
+    """全員まとめて方式で使う順位ポイント表。
+
+    主催者が手で直した表（overall_rank_point_table）が人数と同じ長さならそれを使い、
+    未設定または人数と合わないときは N点〜1点 の初期値を使う。
+    """
+    table = tournament["scoring_config"].get("overall_rank_point_table")
+    if table and len(table) == player_count:
+        return list(table)
+    return scoring_logic.default_overall_point_table(player_count)
+
+
+def overall_point_table_mismatch(tournament):
+    """手で直した順位ポイント表の長さが参加人数と合わないか（主催者画面の警告用）。"""
+    if get_rank_scope(tournament) != RANK_SCOPE_OVERALL:
+        return False
+    table = tournament["scoring_config"].get("overall_rank_point_table")
+    if not table:
+        return False
+    return len(table) != len(db.get_tournament_members(tournament["id"]))
+
+
+def _round_tables(round_id):
+    """回戦の卓ごとのmember_idリスト（卓番号順の(卓番号, [member_id...])のリスト）。"""
+    table_member_ids = {}
+    for seat in db.get_round_seats(round_id):
+        table_member_ids.setdefault(seat["table_number"], []).append(seat["member_id"])
+    return sorted(table_member_ids.items())
+
+
+def is_round_complete(round_id):
+    """回戦の全卓の素点がそろっているか（卓がない回戦はFalse）。"""
+    raw_scores = db.get_round_results(round_id)
+    tables = _round_tables(round_id)
+    return bool(tables) and all(mid in raw_scores for _, mids in tables for mid in mids)
+
+
 def compute_round_totals(tournament, round_id):
     """指定回戦の成績（素点）から、評価方式に応じた計算結果を返す（{member_id: 値}）。
 
-    順位付け（ウマ・オカ・飛び賞・順位ポイント）は卓ごとに行う。8人2卓の回戦なら、
-    卓1・卓2それぞれの中で1〜4位を決める。まだ成績が入力されていない卓は結果に含めない。
+    順位の付け方が「卓ごと」（既定）なら、順位付け（ウマ・オカ・飛び賞・順位ポイント）は
+    卓ごとに行う。8人2卓の回戦なら、卓1・卓2それぞれの中で1〜4位を決める。まだ成績が
+    入力されていない卓は結果に含めない。
+
+    「全員まとめて」（ポイント評価のみ）なら、その回戦の全卓の全員を素点順に並べて
+    N点〜1点を付ける。一部の卓だけ入力済みの間は途中の順位に意味がないので、全卓が
+    そろうまで空（寄与0）を返す。
     """
     raw_scores = db.get_round_results(round_id)
+    if get_rank_scope(tournament) == RANK_SCOPE_OVERALL:
+        if not is_round_complete(round_id):
+            return {}
+        member_to_number, _ = _player_number_map(tournament["id"])
+        seated = [mid for _, mids in _round_tables(round_id) for mid in mids]
+        # 同点の並び順を選手番号順にそろえるため、選手番号キーで計算してから戻す
+        scores_by_number = {member_to_number[mid]: raw_scores[mid] for mid in seated}
+        point_table = overall_point_table_for(tournament, len(seated))
+        values = scoring_logic.compute_rank_points_overall(scores_by_number, point_table)
+        number_to_member = {member_to_number[mid]: mid for mid in seated}
+        return {number_to_member[pn]: v for pn, v in values.items()}
+
     if tournament["scoring_mode"] == "得点":
         uma_config, tobi_amount = _extract_uma_config_and_tobi(tournament["scoring_config"])
         tobi_busters = db.get_round_tobi_busters(round_id)
     else:
         point_table = tournament["scoring_config"]["rank_point_table"]
 
-    table_member_ids = {}
-    for seat in db.get_round_seats(round_id):
-        table_member_ids.setdefault(seat["table_number"], []).append(seat["member_id"])
-
     round_values = {}
-    for member_ids in table_member_ids.values():
+    for _, member_ids in _round_tables(round_id):
         table_scores = {mid: raw_scores[mid] for mid in member_ids if mid in raw_scores}
         if len(table_scores) < len(member_ids):
             continue  # 未入力の卓（一部だけ入力された卓も、順位が決まらないので計算しない）
@@ -145,6 +215,39 @@ def _cumulative_raw_score_sum(tournament_id):
     return cumulative
 
 
+def build_tiebreak_scores(tournament):
+    """累計が同点のときの2段目（素点合計）。ポイント方式だけ。得点方式は None。
+
+    累計順位表（compute_standings）と蛇行の席決め（run_next_round）で同じ値を使う
+    （2026-11-19）。
+    """
+    if tournament["scoring_mode"] == "得点":
+        return None
+    return _cumulative_raw_score_sum(tournament["id"])
+
+
+def is_final_round(tournament, round_number):
+    """全回戦数が設定されていて、round_numberがその最終回戦か。"""
+    total_rounds = get_total_rounds(tournament)
+    return total_rounds is not None and round_number == total_rounds
+
+
+def next_round_is_fixed(tournament, member_count):
+    """次の回戦の卓組みが乱数で変わらないか（「作り直す」ボタンを出さないための判定）。
+
+    蛇行方式で、抜け番が出ない人数（4の倍数）のときに、
+    - 第2回戦以降（累計順の蛇行・最終回戦の順位順はどちらも決まった並び）
+    - 全回戦数を設定した大会の第1回戦（選手番号順）
+    はやり直しても同じ結果になる。ワンデー方式・抜け番が出る人数・
+    全回戦数なしの第1回戦は乱数を使うのでFalse。
+    """
+    if tournament["table_method"] != "蛇行" or member_count % 4 != 0:
+        return False
+    if db.count_rounds(tournament["id"]) >= 1:
+        return True
+    return get_total_rounds(tournament) is not None
+
+
 def run_next_round(tournament, rng=None):
     """次回戦の卓組みをその場で実行する（DB未保存、プレビュー用）。
 
@@ -163,7 +266,10 @@ def run_next_round(tournament, rng=None):
     if tournament["table_method"] == "蛇行":
         cumulative_scores = None if round_number == 1 else build_cumulative_scores(tournament)
         absent, tables = table_logic.snake_round(
-            player_numbers, appearance_counts, previous_absent, cumulative_scores, rng
+            player_numbers, appearance_counts, previous_absent, cumulative_scores, rng,
+            final_round=is_final_round(tournament, round_number),
+            ordered_first_round=get_total_rounds(tournament) is not None,
+            tiebreak_scores=None if round_number == 1 else build_tiebreak_scores(tournament),
         )
     else:
         position_history = build_position_history(tournament_id)
@@ -189,22 +295,68 @@ def save_confirmed_round(tournament_id, round_number, absent_player_numbers, tab
 def compute_standings(tournament):
     """大会内の現在の順位表を返す（1位から順のリスト）。
 
-    各要素: {"member_id", "player_number", "value"}（valueは累計得点または累計順位ポイント）
+    各要素: {"member_id", "player_number", "value", "raw_total"}
+    （valueは累計得点または累計順位ポイント。raw_totalはポイント方式の素点合計＝ウマ・オカ・
+    飛び賞を含まない実際の点数の合計で、並び順の2段目と同じ値。未入力の人は0。得点方式はNone）
     得点方式: 累計得点の降順（同点は選手番号昇順）
     ポイント方式: 累計順位ポイント→素点合計→選手番号の3段階タイブレーク
+    席決め（蛇行）も table_logic.standings_order で同じ並びにする。
     """
     _, number_to_member = _player_number_map(tournament["id"])
     cumulative = build_cumulative_scores(tournament)
 
-    if tournament["scoring_mode"] == "得点":
-        ordered_numbers = sorted(cumulative.keys(), key=lambda pn: (-cumulative.get(pn, 0), pn))
-    else:
-        raw_score_sums = _cumulative_raw_score_sum(tournament["id"])
-        ordered_numbers = scoring_logic.rank_by_points_then_score(
-            list(cumulative.keys()), cumulative, raw_score_sums
-        )
+    tiebreak = build_tiebreak_scores(tournament)
+    # 席決め（run_next_round → table_logic.snake_rank）と同じ関数で並べる
+    ordered_numbers = table_logic.standings_order(list(cumulative.keys()), cumulative, tiebreak)
 
     return [
-        {"member_id": number_to_member[pn], "player_number": pn, "value": cumulative.get(pn, 0)}
+        {
+            "member_id": number_to_member[pn],
+            "player_number": pn,
+            "value": cumulative.get(pn, 0),
+            "raw_total": None if tiebreak is None else tiebreak.get(pn, 0),
+        }
         for pn in ordered_numbers
+    ]
+
+
+def compute_final_ranking(tournament):
+    """最終順位（12/19大会向け実装依頼 2.3対応）。
+
+    全回戦数が設定されていて、その最終回戦の全卓の素点がそろっているときだけ返す。
+    それ以外（未設定・最終回戦がまだ・入力途中）はNone。
+    1卓の1位が優勝、2位以下は最終回戦の全員の素点順。最終回戦の素点が同点のときは
+    全回戦の累計（順位ポイント方式なら累計順位ポイント、得点方式なら累計得点）→
+    全回戦の素点合計（ウマ・オカ抜き）→ 選手番号の若い方 の順で上位にする。
+
+    戻り値: [{"member_id", "player_number", "table_number", "raw_score"}, ...]（優勝から順）
+    """
+    total_rounds = get_total_rounds(tournament)
+    if total_rounds is None:
+        return None
+    final_round = next(
+        (r for r in db.get_rounds(tournament["id"]) if r["round_number"] == total_rounds), None
+    )
+    if final_round is None or not is_round_complete(final_round["id"]):
+        return None
+
+    member_to_number, number_to_member = _player_number_map(tournament["id"])
+    raw_scores = db.get_round_results(final_round["id"])
+    tables = _round_tables(final_round["id"])
+    table_of = {member_to_number[mid]: tn for tn, mids in tables for mid in mids}
+    scores_by_number = {member_to_number[mid]: raw_scores[mid] for _, mids in tables for mid in mids}
+    ordered = scoring_logic.final_ranking(
+        [[member_to_number[mid] for mid in mids] for _, mids in tables],
+        scores_by_number,
+        cumulative_points=build_cumulative_scores(tournament),
+        raw_score_sums=_cumulative_raw_score_sum(tournament["id"]),
+    )
+    return [
+        {
+            "member_id": number_to_member[pn],
+            "player_number": pn,
+            "table_number": table_of[pn],
+            "raw_score": scores_by_number[pn],
+        }
+        for pn in ordered
     ]

@@ -14,6 +14,7 @@ import streamlit_authenticator as stauth
 from streamlit.testing.v1 import AppTest
 
 import db
+import scoring_logic
 import tournament_service as svc
 
 APP_PATH = str(Path(__file__).parent.parent / "app.py")
@@ -31,6 +32,9 @@ SCORE_CONFIG = {
 }
 
 POINT_CONFIG = {"rank_point_table": [3, 1, -1, -3], "start_point": 35000}
+
+# サークルの通常の大会と同じ開始点数30,000点（画面の入力は300、4人の合計は1200）
+SCORE_CONFIG_30000 = {**SCORE_CONFIG, "start_point": 30000}
 
 
 @pytest.fixture
@@ -327,7 +331,7 @@ def _setup_tournament_with_round(scoring_mode="得点", scoring_config=SCORE_CON
     user_id, tenant_id, member_ids, tournament_id = _setup_admin_with_tournament()
     for i, member_id in enumerate(member_ids, start=1):
         db.add_tournament_member(tournament_id, member_id, i)
-    if scoring_mode != "得点":
+    if (scoring_mode, scoring_config) != ("得点", SCORE_CONFIG):
         db.update_tournament(
             tenant_id, tournament_id, "テスト大会", "ワンデー", "蛇行", scoring_mode,
             scoring_config, "受付順", None, None, "準備中",
@@ -475,6 +479,48 @@ def test_guest_submit_rechecks_sum_when_a_score_is_edited_and_submitted_at_once(
     assert not at.exception
     assert db.get_round_results(db.get_rounds(tournament_id)[0]["id"]) == {}  # 保存されない
     assert any("送信できませんでした" in e.value for e in at.error)
+
+
+# 合計チェックの境界値（開始点数30,000点＝合計1200）。「ちょうど」だけが通り、
+# 100点（入力の1目盛り）多くても少なくても止まることを守る。
+# 「足りないときだけ弾く」「多いときだけ弾く」のような片側だけの壊れ方もここで赤になる。
+SUM_BOUNDARY_CASES = [
+    pytest.param([458, 342, 250, 150], True, id="ちょうど1200→送信できる"),
+    pytest.param([458, 342, 250, 151], False, id="100点多い1201→送信できない"),
+    pytest.param([458, 342, 250, 149], False, id="100点少ない1199→送信できない"),
+]
+
+
+@pytest.mark.parametrize("hundreds, accepted", SUM_BOUNDARY_CASES)
+def test_guest_sum_boundary_at_start_point_30000(app_env, hundreds, accepted):
+    """ゲストの代表者送信: 合計が開始点数×4（30,000×4＝1200）ぴったりのときだけ保存される。"""
+    user_id, tenant_id, member_ids, tournament_id, raw_token = _setup_tournament_with_round(
+        scoring_config=SCORE_CONFIG_30000
+    )
+
+    at = AppTest.from_file(APP_PATH)
+    at.query_params["guest"] = raw_token
+    at.run()
+    score_inputs = [ni for ni in at.number_input if ni.key and ni.key.startswith("guest_score_")]
+    for ni, v in zip(score_inputs, hundreds):
+        ni.set_value(v)
+    at.checkbox[0].check()
+    at.run()
+
+    submit_btn = at.button[_find_button(at, "この内容で送信する")]
+    saved = db.get_round_results(db.get_rounds(tournament_id)[0]["id"])
+    if accepted:
+        assert not submit_btn.disabled
+        submit_btn.click().run()
+        assert not at.exception
+        saved = db.get_round_results(db.get_rounds(tournament_id)[0]["id"])
+        assert sorted(saved.values(), reverse=True) == [45800, 34200, 25000, 15000]
+    else:
+        assert submit_btn.disabled
+        assert any(
+            f"合計が{sum(hundreds)}です。1200になるよう確認してください。" in e.value for e in at.error
+        )
+        assert saved == {}
 
 
 def test_guest_view_already_submitted_table_is_read_only(app_env):
@@ -634,6 +680,36 @@ def test_admin_correction_of_saved_table_is_also_checked(app_env):
     assert db.get_round_results(round_id) == original
 
 
+@pytest.mark.parametrize("hundreds, accepted", SUM_BOUNDARY_CASES)
+def test_admin_sum_boundary_at_start_point_30000(app_env, hundreds, accepted):
+    """主催者画面での保存: 卓1はぴったり1200、卓2を境界値にする。卓2がずれていれば
+    どちらの卓も保存されず、ぴったりなら両方保存される（9/19時点では合計チェックが無かった）。"""
+    _, tournament_id, round_id, table1, table2 = _setup_two_table_round(
+        scoring_config=SCORE_CONFIG_30000
+    )
+    scores = {
+        **dict(zip(table1, (40000, 35000, 30000, 15000))),  # 合計120000（ぴったり）
+        **dict(zip(table2, (v * 100 for v in hundreds))),
+    }
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+    _set_admin_scores(at, scores)
+    at.button[_find_button(at, "成績を保存")].click().run()
+
+    assert not at.exception
+    assert not any("卓1の合計が" in e.value for e in at.error)
+    if accepted:
+        assert db.get_round_results(round_id) == scores
+    else:
+        assert any(
+            f"卓2の合計が{sum(hundreds)}です。1200になるよう確認してください。" in e.value for e in at.error
+        )
+        assert any("保存できません" in e.value and "卓2" in e.value for e in at.error)
+        assert db.get_round_results(round_id) == {}
+
+
 def test_admin_save_blocked_when_start_point_is_missing(app_env):
     """開始点数が未設定の大会(既存のポイント方式大会など)では、ゲスト画面と同じく成績を保存できない。"""
     _, tournament_id, round_id, table1, table2 = _setup_two_table_round(
@@ -672,7 +748,7 @@ def test_point_mode_values_are_shown_without_trailing_zeros_and_per_table(app_en
     assert value_columns, "値の列を持つ表が表示されていない"
     flat = [v for column in value_columns for v in column]
     assert not any(v.endswith(".0000") or v.endswith(".0") for v in flat)
-    # この回戦の計算結果表(値の降順): 卓2の1位4、卓1の同着2.5×2、卓2の2位1、...
+    # 第N回戦の計算結果表(値の降順): 卓2の1位4、卓1の同着2.5×2、卓2の2位1、...
     assert sorted(value_columns[0], key=float, reverse=True) == ["4", "2.5", "2.5", "1", "-2", "-2.5", "-2.5", "-3"]
 
 
@@ -790,8 +866,8 @@ def test_admin_shows_score_mode_totals_in_hundreds(app_env):
     assert not at.exception
     columns = [[str(v) for v in t.value["値"]] for t in at.table if "値" in t.value.columns]
     standings_columns = [[str(v) for v in t.value["総合得点"]] for t in at.table if "総合得点" in t.value.columns]
-    assert columns[0] == ["940", "580", "170", "-290"]  # この回戦の計算結果(値の降順)
-    assert standings_columns[0] == ["940", "580", "170", "-290"]  # 大会内順位表
+    assert columns[0] == ["940", "580", "170", "-290"]  # 第N回戦の計算結果(値の降順)
+    assert standings_columns[0] == ["940", "580", "170", "-290"]  # 累計順位表
 
 
 def test_admin_score_input_in_hundreds_saves_actual_points(app_env):
@@ -876,7 +952,7 @@ def test_tournament_edit_form_rejects_wrong_digits(app_env):
 
 GUEST_T1 = (45000, 35000, 32000, 28000)   # ゲストが送る卓1(合計140000)
 ADMIN_T2 = (60000, 40000, 30000, 10000)   # 主催者が入れる卓2(合計140000)
-STALE_TABLE_MESSAGE = "卓1は他の人が入力済みです。ページを再読み込みしてください"
+STALE_TABLE_MESSAGE = "卓1は他の人が入力済みです。上の「最新の状態に更新」を押してください"
 CHANGED_JUST_BEFORE_SAVE_MESSAGE = "保存の直前に他の人がこの回戦の成績を入力しました"
 
 
@@ -1008,3 +1084,181 @@ def test_admin_screen_is_not_stale_after_its_own_save(app_env):
     assert not at.exception
     assert not any(STALE_TABLE_MESSAGE in w.value for w in at.warning)
     assert [db.get_round_results(round_id)[m] for m in table1] == [61000, 39000, 30000, 10000]
+
+
+# ---------------------------------------------------------------------------
+# 「最新の状態に更新」と、保存の直後のメッセージ（2026-11-19 staging リハーサルから）
+# ---------------------------------------------------------------------------
+
+def _admin_score_values(at, member_ids):
+    values = {int(ni.key.rsplit("_", 1)[1]): ni.value for ni in at.number_input if ni.key and ni.key.startswith("score_")}
+    return [values[m] for m in member_ids]
+
+
+def test_refresh_button_loads_guest_scores_and_keeps_admin_typing(app_env):
+    """主催者が卓2を打ちかけの間に、ゲストが卓1を送信。「最新の状態に更新」で卓1の欄に
+    ゲストの素点が入り、打ちかけの卓2はそのまま残る。そのあと保存しても卓1は上書きされない。"""
+    _, _, round_id, table1, table2 = _setup_two_table_round()
+    at = _open_admin()
+    _set_admin_scores(at, dict(zip(table2, ADMIN_T2)))
+    db.submit_guest_round_results(round_id, dict(zip(table1, GUEST_T1)), {})  # 別の端末から
+    at.run()
+    assert _admin_score_values(at, table1) == [0, 0, 0, 0]  # 古いまま
+    assert any(STALE_TABLE_MESSAGE in w.value for w in at.warning)
+
+    at.button[_find_button(at, "最新の状態に更新")].click().run()
+
+    assert not at.exception
+    assert _admin_score_values(at, table1) == [v // 100 for v in GUEST_T1]
+    assert _admin_score_values(at, table2) == [v // 100 for v in ADMIN_T2]  # 打ちかけは残る
+    assert not any(STALE_TABLE_MESSAGE in w.value for w in at.warning)
+
+    at.button[_find_button(at, "成績を保存")].click().run()
+    assert not at.exception
+    saved = db.get_round_results(round_id)
+    assert [saved[m] for m in table1] == list(GUEST_T1)
+    assert [saved[m] for m in table2] == list(ADMIN_T2)
+    meta = db.get_round_result_meta(round_id)
+    assert all(meta[m]["input_source"] == "guest" for m in table1)  # 卓1は入れ直されていない
+
+
+def test_refresh_button_without_changes_keeps_inputs(app_env):
+    _, _, round_id, table1, _ = _setup_two_table_round()
+    at = _open_admin()
+    _set_admin_scores(at, {table1[0]: 45000})
+    at.button[_find_button(at, "最新の状態に更新")].click().run()
+    assert not at.exception
+    assert _admin_score_values(at, table1)[0] == 450
+    assert any("最新の状態にしました" in c.value for c in at.caption)
+
+
+def test_refresh_button_is_primary_and_other_buttons_unchanged(app_env):
+    """「最新の状態に更新」だけを目立つ色（primary）にする（2026-11-20 staging 確認から）。"""
+    _setup_two_table_round()
+    at = _open_admin()
+    assert at.button[_find_button(at, "最新の状態に更新")].proto.type == "primary"
+    assert at.button[_find_button(at, "成績を保存")].proto.type != "primary"
+
+
+def test_headings_name_round_number_and_cumulative_standings(app_env):
+    """見出しは「第N回戦の計算結果（…）」と「累計順位表」（2026-11-20 staging 確認から）。"""
+    _, _, round_id, table1, table2 = _setup_two_table_round()
+    db.submit_guest_round_results(round_id, dict(zip(table1, GUEST_T1)), {})
+    at = _open_admin()
+    assert not at.exception
+    assert any(c.value == "第1回戦の計算結果（総合得点・100点単位）" for c in at.caption)  # 得点方式
+    texts = [m.value for m in at.markdown]
+    assert "**累計順位表**" in texts
+    assert not any("大会内順位表" in t or "この回戦の計算結果" in t for t in texts + [c.value for c in at.caption])
+
+
+def _standings_table(at):
+    return next(
+        t.value for t in at.table
+        if "順位" in t.value.columns and ("合計ポイント" in t.value.columns or "総合得点" in t.value.columns)
+    )
+
+
+def _setup_point_round_with_both_tables():
+    """ポイント方式・8人2卓の第1回戦を両卓とも入力済みにする。各順位とも卓2の方が素点が高い。"""
+    _, tournament_id, round_id, table1, table2 = _setup_two_table_round("ポイント", POINT_CONFIG)
+    db.submit_guest_round_results(round_id, dict(zip(table1, GUEST_T1)), {})
+    db.submit_guest_round_results(round_id, dict(zip(table2, ADMIN_T2)), {})
+    return tournament_id, table1, table2
+
+
+def test_standings_shows_raw_total_next_to_points_for_admin_and_guest(app_env):
+    """ポイント方式の累計順位表に「素点合計」（100点単位）が「合計ポイント」の右隣に出る。
+    値は並び順に使う素点合計と同じ（2026-11-20 staging 確認から）。"""
+    tournament_id, table1, table2 = _setup_point_round_with_both_tables()
+    user_id = db.get_user_by_username("admin1")["id"]
+    raw_token = db.create_guest_link(tournament_id, user_id)
+    tenant_id = db.get_user_by_id(user_id)["tenant_id"]
+    standings = svc.compute_standings(db.get_tournament(tenant_id, tournament_id))
+    expected = [scoring_logic.format_hundreds(row["raw_total"]) for row in standings]
+    # 同ポイント（卓1の1位と卓2の1位など）は素点合計の多い卓2の人が上
+    assert [row["member_id"] for row in standings][:2] == [table2[0], table1[0]]
+    assert expected[:2] == ["600", "450"]
+
+    admin = _open_admin()
+    guest = AppTest.from_file(APP_PATH)
+    guest.query_params["guest"] = raw_token
+    guest.run()
+    for at in (admin, guest):
+        assert not at.exception
+        table = _standings_table(at)
+        columns = list(table.columns)
+        assert columns.index("素点合計") == columns.index("合計ポイント") + 1
+        assert [str(v) for v in table["素点合計"]] == expected
+
+
+def test_standings_has_no_raw_total_for_score_mode(app_env):
+    _, _, round_id, table1, table2 = _setup_two_table_round()  # 得点方式
+    db.submit_guest_round_results(round_id, dict(zip(table1, GUEST_T1)), {})
+    at = _open_admin()
+    assert not at.exception
+    assert "素点合計" not in _standings_table(at).columns
+
+
+def test_save_message_survives_rerun_and_second_press_says_already_saved(app_env):
+    """保存の直後に「保存しました」が残る。もう一度押すと「保存済みです（変更はありません）」。"""
+    _, _, round_id, table1, table2 = _setup_two_table_round()
+    at = _open_admin()
+    _set_admin_scores(at, {**dict(zip(table1, GUEST_T1)), **dict(zip(table2, ADMIN_T2))})
+    at.button[_find_button(at, "成績を保存")].click().run()
+
+    assert not at.exception
+    assert any("第1回戦の成績を保存しました（卓1・卓2）。" in s.value for s in at.success)
+    assert not any("保存する変更はありません" in i.value for i in at.info)
+
+    at.button[_find_button(at, "成績を保存")].click().run()
+    assert any("この回戦の成績は保存済みです（変更はありません）。" in i.value for i in at.info)
+    assert not any("成績を保存しました" in s.value for s in at.success)  # 前のメッセージは1回だけ
+
+
+def test_save_with_nothing_entered_says_not_saved(app_env):
+    _setup_two_table_round()
+    at = _open_admin()
+    at.button[_find_button(at, "成績を保存")].click().run()
+    assert any("入力した卓がないため、保存していません。" in i.value for i in at.info)
+
+
+# ---------------------------------------------------------------------------
+# ログイン後の Cookie（F5 でログアウトする件、2026-11-20 staging）
+# ---------------------------------------------------------------------------
+
+def _count_set_cookie(monkeypatch):
+    from streamlit_authenticator.controllers.cookie_controller import CookieController
+
+    calls = []
+    monkeypatch.setattr(CookieController, "set_cookie", lambda self: calls.append(1))
+    return calls
+
+
+def test_login_keeps_placing_cookie_writer_on_reruns_for_a_while(app_env, monkeypatch):
+    """ログイン直後の st.rerun() で部品が消されても、作り直した画面でまた置くので Cookie が書かれる。"""
+    _add_user("admin1", "adminpass123", email="admin1@example.com")
+    calls = _count_set_cookie(monkeypatch)
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+    assert not at.exception
+    assert any("ログイン中" in m.value for m in at.markdown)
+    # ログインの回で1回 ＋ st.rerun() で作り直した画面で1回
+    assert len(calls) == 2
+    at.run()  # まだ時間内なら、画面を作り直すたびに置き直す
+    assert len(calls) == 3
+
+
+def test_cookie_writer_stops_after_the_window(app_env, monkeypatch):
+    _add_user("admin1", "adminpass123", email="admin1@example.com")
+    calls = _count_set_cookie(monkeypatch)
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _login(at, "admin1", "adminpass123")
+    count_after_login = len(calls)
+    at.session_state["auth_cookie_pending_until"] = 0  # 時間切れ
+    at.run()
+    assert not at.exception
+    assert len(calls) == count_after_login
+

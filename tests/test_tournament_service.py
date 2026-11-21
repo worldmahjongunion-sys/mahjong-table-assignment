@@ -6,6 +6,7 @@ import random
 import pytest
 
 import db
+import table_logic
 import tournament_service as svc
 
 
@@ -134,6 +135,8 @@ def test_position_history_and_co_seat_counts_accumulate_for_one_day_method(temp_
 
     position_history = svc.build_position_history(tid)
     # 8人・T=2・R=0で4半荘フル出場なので、全員が東南西北の4方位をちょうど1回ずつ経験
+    # 履歴が空だと下のforが0回で終わって緑のまま通るため、8人全員分あることを先に確かめる
+    assert set(position_history) == set(range(100, 108))
     for positions in position_history.values():
         assert positions == {"東", "南", "西", "北"}
 
@@ -321,7 +324,7 @@ def test_uncompleted_table_is_not_scored(temp_db):
 
 
 def test_cumulative_and_standings_are_per_table_across_rounds(temp_db):
-    """累計・大会内順位表も卓ごとの値の積み上げになる（2回戦分）。"""
+    """累計・累計順位表も卓ごとの値の積み上げになる（2回戦分）。"""
     tournament, round1, table1, table2 = _setup_two_table_round("ポイント", POINT_CONFIG)
     tid = tournament["id"]
     _save_scores(round1, table1, (50000, 30000, 20000, 10000))
@@ -344,23 +347,46 @@ def test_cumulative_and_standings_are_per_table_across_rounds(temp_db):
     ]
 
 
+def test_standings_raw_total_is_the_tiebreak_value(temp_db):
+    """累計順位表の「素点合計」（raw_total）は並び順の2段目と同じ値。得点方式は None（2026-11-20）。"""
+    tournament, round1, table1, table2 = _setup_two_table_round("ポイント", POINT_CONFIG)
+    tid = tournament["id"]
+    _save_scores(round1, table1, (50000, 30000, 20000, 10000))  # 卓2は未入力
+    tournament = db.get_tournament(db.get_user_by_username("owner")["tenant_id"], tid)
+    number_of = {m["member_id"]: m["player_number"] for m in db.get_tournament_members(tid)}
+
+    standings = svc.compute_standings(tournament)
+    tiebreak = svc.build_tiebreak_scores(tournament)
+    assert [row["raw_total"] for row in standings] == [tiebreak.get(row["player_number"], 0) for row in standings]
+    raw_by_member = {row["member_id"]: row["raw_total"] for row in standings}
+    assert [raw_by_member[m] for m in table1] == [50000, 30000, 20000, 10000]
+    # 卓2は未入力なので、今までどおり表にまだ出ない（出る人の素点合計は .get(.., 0) で0扱い）
+    assert not set(table2) & set(raw_by_member)
+    assert all(number_of[row["member_id"]] == row["player_number"] for row in standings)
+
+
+def test_standings_raw_total_is_none_for_score_mode(temp_db):
+    tournament, round1, table1, _ = _setup_two_table_round("得点", SCORE_CONFIG)
+    _save_scores(round1, table1, (50000, 30000, 20000, 10000))
+    tournament = db.get_tournament(db.get_user_by_username("owner")["tenant_id"], tournament["id"])
+    assert all(row["raw_total"] is None for row in svc.compute_standings(tournament))
+
+
 def test_snake_next_round_uses_per_table_cumulative_points(temp_db):
-    """蛇行方式の次回戦の並び順: 卓ごとの順位ポイント（同ポイントは選手番号順）で1〜8位を
-    決め、蛇行で卓A={1,4,5,8位}・卓B={2,3,6,7位}に振り分ける。"""
+    """蛇行方式の次回戦の並び順: 卓ごとの順位ポイント（同ポイントは累計順位表と同じく
+    素点合計の多い順、2026-11-19）で1〜8位を決め、蛇行で卓A={1,4,5,8位}・卓B={2,3,6,7位}に
+    振り分ける。"""
     tournament, round1, table1, table2 = _setup_two_table_round("ポイント", POINT_CONFIG)
     tid = tournament["id"]
     number_of = {m["member_id"]: m["player_number"] for m in db.get_tournament_members(tid)}
     _save_scores(round1, table1, (50000, 30000, 20000, 10000))
     _save_scores(round1, table2, (8000, 6000, 4000, 2000))
 
-    # 3点・1点・-1点・-3点の組が卓1・卓2に1人ずつ。同点内は選手番号の若い順
-    def by_number(a, b):
-        return sorted([a, b], key=number_of.get)
-
-    w_a, w_b = by_number(table1[0], table2[0])
-    s_a, s_b = by_number(table1[1], table2[1])
-    t_a, t_b = by_number(table1[2], table2[2])
-    l_a, l_b = by_number(table1[3], table2[3])
+    # 3点・1点・-1点・-3点の組が卓1・卓2に1人ずつ。同点内は素点合計の多い順（どの組も卓1が上）
+    w_a, w_b = table1[0], table2[0]
+    s_a, s_b = table1[1], table2[1]
+    t_a, t_b = table1[2], table2[2]
+    l_a, l_b = table1[3], table2[3]
     expected_tables = [
         {number_of[m] for m in (w_a, s_b, t_a, l_b)},
         {number_of[m] for m in (w_b, s_a, t_b, l_a)},
@@ -372,3 +398,6 @@ def test_snake_next_round_uses_per_table_cumulative_points(temp_db):
     assert round_number == 2
     assert absent == []
     assert [set(t.values()) for t in tables] == expected_tables
+    # 席決めの並びは累計順位表と同じ
+    standings = [row["player_number"] for row in svc.compute_standings(tournament)]
+    assert tables == table_logic.snake_tables(standings)
