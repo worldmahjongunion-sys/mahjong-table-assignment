@@ -12,6 +12,7 @@ import streamlit_authenticator as stauth
 
 import db
 import exports
+import monitor_view
 import scoring_logic
 import tournament_service
 from table_logic import position_sort_key
@@ -46,6 +47,14 @@ st.iframe(
 )
 
 db.init_db()
+
+# ---- 大会モニター画面（TV表示用・閲覧専用。仕様書.md 3.9） ----
+# 見出し・ゲスト画面・ログインより前に判定してst.stop()し、入力のあるコードを一切実行させない。
+# guest と両方付いたURLでも、入力できない方（モニター）にする。
+if "monitor" in st.query_params:
+    st.set_page_config(page_title="大会モニター", layout="wide", initial_sidebar_state="collapsed")
+    monitor_view.render_monitor_view(st.query_params.get("monitor", ""))
+    st.stop()
 
 # ログイン試行のタイミング差から既存ユーザー名かどうかを推測されないよう、
 # ユーザーが存在しない場合もこのダミーハッシュ相手にbcrypt検証を行い、
@@ -1992,10 +2001,19 @@ for tournament in tournaments:
                 raw_token = st.session_state.get(guest_token_key)
                 if raw_token:
                     st.code(f"{APP_BASE_URL}/?guest={raw_token}")
+                    # 別のセッションで再発行・無効化されていたら、使えないモニターのリンクは出さない
+                    linked = db.get_tournament_by_guest_token(raw_token)
+                    if linked and linked["id"] == tournament_id:
+                        st.caption("大会モニター画面のリンク（TV表示用・入力不可。再発行・無効化すると見られなくなります）")
+                        st.code(f"{APP_BASE_URL}/?monitor={raw_token}")
                 else:
                     st.caption(
                         "このブラウザセッションで発行したリンクではないため、文字列は再表示できません"
                         "（生トークンはDBに保存していません）。共有し忘れた場合は下から再発行してください。"
+                    )
+                    st.caption(
+                        "大会モニター画面（TV表示用）は、控えてあるゲスト用リンクの `?guest=` を "
+                        "`?monitor=` に変えると開けます（再発行は不要です）。"
                     )
                 link_action_cols = st.columns(2)
                 if link_action_cols[0].button("リンクを再発行する（旧リンクは失効）", key=f"reissue_guest_link_{tournament_id}"):
