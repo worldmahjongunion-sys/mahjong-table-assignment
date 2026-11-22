@@ -1,7 +1,6 @@
 import os
 import secrets
 import smtplib
-import time
 from datetime import datetime, timezone
 from email.message import EmailMessage
 
@@ -10,6 +9,7 @@ import stripe
 import streamlit as st
 import streamlit_authenticator as stauth
 
+import auth_cookie
 import db
 import exports
 import monitor_view
@@ -558,16 +558,6 @@ def get_optional_setting(env_var: str, secrets_key: str, default: str | None = N
         return default
 
 
-def build_credentials() -> dict:
-    users = db.get_all_users()
-    return {
-        "usernames": {
-            u["username"]: {"name": u["username"], "password": u["password_hash"]}
-            for u in users
-        }
-    }
-
-
 APP_BASE_URL = get_optional_setting("APP_BASE_URL", "app_base_url", "http://localhost:8501").rstrip("/")
 
 # 運営（自分）専用の管理画面にアクセスできるユーザー名の一覧。
@@ -698,30 +688,23 @@ if checkout_status == "cancel":
     st.stop()
 
 # ---- 通常のログイン／サインアップ ----
-AUTH_COOKIE_REWRITE_SECONDS = 15  # ログイン後、Cookie を書かせる部品を置き直す時間
 auth_cookie_name = get_auth_setting("AUTH_COOKIE_NAME", "cookie_name")
 auth_cookie_key = get_auth_setting("AUTH_COOKIE_KEY", "cookie_key")
 auth_invite_code = get_auth_setting("AUTH_INVITE_CODE", "invite_code")
-
-authenticator = stauth.Authenticate(
-    build_credentials(),
-    auth_cookie_name,
-    auth_cookie_key,
-    cookie_expiry_days=30,
-    auto_hash=False,
-)
 
 # streamlit-authenticatorの標準ログイン(authenticator.login())は使わず、
 # 自前でフォームと認証チェックを実装している。理由:
 # - 標準実装の総当たり対策(max_login_attempts)は、認証情報の辞書を毎リラン
 #   再構築しているためリランをまたいで失敗回数を保持できず機能しない
 # - 入力されたユーザー名を受け取れないと、ユーザー名単位のレート制限が組めない
-# Cookie経由の自動ログインとログアウトは引き続きauthenticatorに任せる。
+# stauth.Authenticate も使わない（作るだけで Cookie の部品が置かれ、その再実行要求で
+# ボタンの処理が打ち切られるため。auth_cookie.py 参照）。使うのは stauth.Hasher だけ。
 
+cookie_expired = False
 if not st.session_state.get("authentication_status"):
-    cookie_token = authenticator.cookie_controller.get_cookie()
-    if cookie_token and "username" in cookie_token:
-        cookie_user = db.get_user_by_username(cookie_token["username"])
+    cookie_username = auth_cookie.read_username(auth_cookie_name, auth_cookie_key)
+    if cookie_username:
+        cookie_user = db.get_user_by_username(cookie_username)
         if cookie_user:
             st.session_state["authentication_status"] = True
             st.session_state["username"] = cookie_user["username"]
@@ -729,8 +712,12 @@ if not st.session_state.get("authentication_status"):
         else:
             # 保存された自動ログイン用Cookieが、存在しないユーザー名を指している場合
             # （DBリセットやアカウント削除後の古いCookieなど）。Cookieを破棄する。
-            authenticator.cookie_controller.delete_cookie()
-            st.warning("ログイン情報の有効期限が切れました。もう一度ログインしてください。")
+            auth_cookie.request_delete(auth_cookie_name)
+            cookie_expired = True
+
+auth_cookie.render()
+if cookie_expired:
+    st.warning("ログイン情報の有効期限が切れました。もう一度ログインしてください。")
 
 if not st.session_state.get("authentication_status"):
     with st.form("login_form"):
@@ -757,8 +744,7 @@ if not st.session_state.get("authentication_status"):
                 st.session_state["authentication_status"] = True
                 st.session_state["username"] = login_user["username"]
                 st.session_state["name"] = login_user["username"]
-                authenticator.cookie_controller.set_cookie()
-                st.session_state["auth_cookie_pending_until"] = time.time() + AUTH_COOKIE_REWRITE_SECONDS
+                auth_cookie.request_write(auth_cookie_name, auth_cookie_key, login_user["username"])
                 db.record_audit_log(
                     action="login",
                     tenant_id=login_user["tenant_id"],
@@ -771,12 +757,6 @@ if not st.session_state.get("authentication_status"):
                 st.session_state["authentication_status"] = False
 
 auth_status = st.session_state.get("authentication_status")
-
-# ログイン直後の st.rerun() で、Cookie を書かせる部品（ブラウザ側で動く）が動く前に消され、
-# Cookie が書かれず F5 でログアウトしていた（通信に遅れがあると毎回。2026-11-20 staging）。
-# ログインからしばらくは、画面を作り直すたびに部品を置き直して、書き込みが終わるまで残す。
-if auth_status and st.session_state.get("auth_cookie_pending_until", 0) > time.time():
-    authenticator.cookie_controller.set_cookie()
 
 if auth_status is False:
     st.error("ユーザー名またはパスワードが違います。")
@@ -897,6 +877,15 @@ if not auth_status:
 
 # ---- ここから先はログイン済みユーザーのみ ----
 
+
+def log_out() -> None:
+    # on_click で画面を作る前に呼ばれるので、押した回のうちにログイン画面になり Cookie も消える
+    st.session_state["logout"] = True
+    for key in ("name", "username", "authentication_status"):
+        st.session_state[key] = None
+    auth_cookie.request_delete(auth_cookie_name)
+
+
 current_user = db.get_user_by_username(st.session_state["username"])
 if current_user is None:
     st.error("ユーザー情報の取得に失敗しました。再度ログインしてください。")
@@ -910,7 +899,7 @@ is_operator = current_user["username"] in OPERATOR_USERNAMES
 
 with st.sidebar:
     st.write(f"ログイン中: {st.session_state['name']}（{role_label}）")
-    authenticator.logout("ログアウト", location="sidebar")
+    st.button("ログアウト", key="Logout", on_click=log_out)
 
     if is_admin:
         with st.expander("メンバーを招待する"):
